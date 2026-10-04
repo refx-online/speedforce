@@ -16,17 +16,21 @@ Design notes worth knowing before changing anything here:
   works across instances. Keys are under ``signalr:`` so they cannot collide with
   the ``bancho:*`` keys bakenohana owns.
 
-* **bakenohana has no redis presence structure today** -- its online sessions live
-  only in its in-memory ``PlayerSession`` registry, which speedforce cannot read.
-  So lazer users see each other but are currently invisible to stable. Writing the
-  same keys from bakenohana's login/logout path is what closes that gap; see
-  notes.md.
+* **Stable presence comes from bakenohana.** It owns the only record of whether a
+  stable player is online -- its in-memory ``PlayerSession`` registry, which
+  nothing else can read. ``PresenceBridge`` (bakenohana
+  ``src/domain/match/presence_bridge.cr``) therefore writes the same
+  ``signalr:presence:*`` keys and publishes ``signalr:presence_changed`` on every
+  change; ``StablePresenceListener`` below subscribes and forwards to watchers.
+  That is what makes a stable user visible to a lazer client and vice versa.
 """
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
+import logging
 from typing import Any
 
 import redis.asyncio as aioredis
@@ -39,6 +43,11 @@ from app.signalr.protocol import HubConnection
 PRESENCE_KEY = "signalr:presence:{user_id}"
 QUEUE_KEY = "signalr:presence_queue_id"
 
+# bakenohana publishes the changed user id here whenever a stable presence changes
+STABLE_CHANNEL = "signalr:presence_changed"
+
+_LOG = logging.getLogger(__name__)
+
 # A presence entry expires this long after its last refresh, so a client that
 # vanishes without a clean disconnect stops reading as online.
 PRESENCE_TTL_SECONDS = 90
@@ -49,8 +58,12 @@ class MetadataHub:
 
     def __init__(self) -> None:
         self._redis: aioredis.Redis | None = None
-        # connection_id -> user_ids this connection is watching
-        self._watching: dict[str, set[int]] = {}
+        # connection_id -> True while it is watching everyone. This is a *flag*,
+        # not a set of user ids: BeginWatchingUserPresence takes no arguments and
+        # means "send me everyone's presence from now on", so a user who comes
+        # online after you subscribed must still reach you. Snapshotting who was
+        # online at subscribe time (an earlier bug here) silently dropped them.
+        self._watching: set[str] = set()
         # every live connection in this process, for watcher fan-out
         self._live: set[HubConnection] = set()
 
@@ -60,7 +73,7 @@ class MetadataHub:
         return self._redis
 
     def _watches(self, connection: HubConnection, user_id: int) -> bool:
-        return user_id in self._watching.get(connection.connection_id, set())
+        return connection.connection_id in self._watching
 
     # ---------------------------------------------------------------- lifecycle
 
@@ -74,11 +87,11 @@ class MetadataHub:
             json.dumps({"type": "ChoosingBeatmap"}),
             ex=PRESENCE_TTL_SECONDS,
         )
-        await self._broadcast(connection.user_id)
+        await self.broadcast(connection.user_id)
 
     async def on_disconnect(self, connection: HubConnection) -> None:
         self._live.discard(connection)
-        self._watching.pop(connection.connection_id, None)
+        self._watching.discard(connection.connection_id)
 
         # only clear presence once the user's *last* connection is gone
         if any(c.user_id == connection.user_id for c in self._live):
@@ -87,7 +100,7 @@ class MetadataHub:
         r = await self.redis()
         with contextlib.suppress(RedisError):
             await r.delete(PRESENCE_KEY.format(user_id=connection.user_id))
-        await self._broadcast(connection.user_id)
+        await self.broadcast(connection.user_id)
 
     # ------------------------------------------------------------- hub methods
 
@@ -99,7 +112,7 @@ class MetadataHub:
             return await self._begin_watching(connection)
 
         if target == "EndWatchingUserPresence":
-            self._watching.pop(connection.connection_id, None)
+            self._watching.discard(connection.connection_id)
             return None
 
         if target == "GetChangesSince":
@@ -137,7 +150,7 @@ class MetadataHub:
         # advance the change cursor the client resumes from after a reconnect
         await r.incr(QUEUE_KEY)
 
-        await self._broadcast(connection.user_id)
+        await self.broadcast(connection.user_id)
         return None
 
     async def _begin_watching(self, connection: HubConnection) -> None:
@@ -149,15 +162,17 @@ class MetadataHub:
         """
         r = await self.redis()
 
+        # flag first, then send the snapshot: if a presence lands between the read
+        # and the flag we would still push it, and the snapshot is just a duplicate
+        # the client overwrites with identical data
+        self._watching.add(connection.connection_id)
+
         online: set[int] = set()
         for key in await r.keys(f"{PRESENCE_KEY.format(user_id='')}*"):
             with contextlib.suppress(ValueError, IndexError):
                 online.add(int(_text(key).rsplit(":", 1)[1]))
 
-        watched = online - {connection.user_id}
-        self._watching[connection.connection_id] = watched
-
-        for user_id in sorted(watched):
+        for user_id in sorted(online - {connection.user_id}):
             await connection.send(
                 "UserPresenceUpdated", user_id, _loads(await r.get(PRESENCE_KEY.format(user_id=user_id)))
             )
@@ -174,7 +189,7 @@ class MetadataHub:
         r = await self.redis()
         return {"beatmapSets": [], "queueId": int(await r.get(QUEUE_KEY) or 0)}
 
-    async def _broadcast(self, user_id: int) -> None:
+    async def broadcast(self, user_id: int) -> None:
         """Push one user's presence to every connection watching them."""
         r = await self.redis()
         payload = _loads(await r.get(PRESENCE_KEY.format(user_id=user_id)))
@@ -203,3 +218,97 @@ def _loads(raw: Any) -> Any:
 
 hub = MetadataHub()
 mount(hub)
+
+
+class StablePresenceListener:
+    """Forwards stable presence changes to lazer watchers.
+
+    bakenohana is the authority on stable sessions, so it publishes the changed
+    user id on ``signalr:presence_changed`` and this pushes the (re-read) presence
+    document to everyone watching that user.
+
+    One listener per process, started once. Without it a lazer client would only
+    learn about a stable user when some *other* event happened to trigger a
+    broadcast, which is not the same as presence.
+    """
+
+    def __init__(self, hub: MetadataHub) -> None:
+        self._hub = hub
+        self._task: asyncio.Task[None] | None = None
+        self._pubsub: aioredis.client.PubSub | None = None
+
+    async def start(self) -> None:
+        if self._task is not None:
+            return
+
+        self._task = asyncio.create_task(self._run(), name="stable-presence-listener")
+        self._task.add_done_callback(lambda _task: self._forget(_task))
+
+    def _forget(self, task: asyncio.Task[None]) -> None:
+        # only clear if this is still the current task; a restart may have
+        # already installed a replacement
+        if self._task is task:
+            self._task = None
+
+    async def stop(self) -> None:
+        if self._task is not None:
+            self._task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._task
+            self._task = None
+
+        if self._pubsub is not None:
+            with contextlib.suppress(Exception):
+                await self._pubsub.aclose()
+            self._pubsub = None
+
+    async def _run(self) -> None:
+        # reconnect loop: a redis blip must not silently stop presence updates
+        while True:
+            try:
+                r = await self._hub.redis()
+                self._pubsub = r.pubsub(ignore_subscribe_messages=True)
+                await self._pubsub.subscribe(STABLE_CHANNEL)
+
+                while True:
+                    message = await self._pubsub.get_message(ignore_subscribe_messages=True, timeout=30.0)
+
+                    if message is None:
+                        continue
+
+                    raw = message.get("data")
+                    if raw is None:
+                        continue
+
+                    await self._handle(_text(raw))
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - listener must survive anything
+                with contextlib.suppress(Exception):
+                    if self._pubsub is not None:
+                        await self._pubsub.aclose()
+                self._pubsub = None
+                await asyncio.sleep(2.0)
+                _LOG.warning("stable presence listener reconnecting: %s", exc)
+
+    async def _handle(self, payload: str) -> None:
+        with contextlib.suppress(ValueError):
+            user_id = int(payload)
+            await self._hub.broadcast(user_id)
+
+
+_listener: StablePresenceListener | None = None
+
+
+async def start_stable_presence() -> None:
+    global _listener
+    if _listener is None:
+        _listener = StablePresenceListener(hub)
+    await _listener.start()
+
+
+async def stop_stable_presence() -> None:
+    global _listener
+    if _listener is not None:
+        await _listener.stop()
+        _listener = None

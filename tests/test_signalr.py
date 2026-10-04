@@ -179,6 +179,19 @@ async def main() -> int:
             "still present",
         )
 
+        print("\nstable presence bridge (bakenohana -> lazer)")
+        # bakenohana publishes the changed user id here; the listener must pick it
+        # up and push the (re-read) presence to watchers.
+        key = PRESENCE_KEY.format(user_id=4242)
+        redis("SET", key, json.dumps({"Activity": {"type": "InSoloGame", "BeatmapID": 5649109}, "client": "stable"}))
+        redis("PUBLISH", "signalr:presence_changed", "4242")
+        await asyncio.sleep(0.5)
+        check("stable presence readable from the shared key", "5649109" in (redis("GET", key) or ""), redis("GET", key))
+        redis("DEL", key)
+        redis("PUBLISH", "signalr:presence_changed", "4242")
+        await asyncio.sleep(0.3)
+        check("stable logout clears the key", redis("GET", key) == "", "still present")
+
     print(f"\n{passed} passed, {len(failed)} failed")
     for f in failed:
         print(f"  - {f}")

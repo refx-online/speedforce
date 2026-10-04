@@ -10,13 +10,20 @@ from app.route import router as route_router
 # below the host import it depends on
 from app.signalr import metadata as _metadata_hub  # noqa: F401
 from app.signalr.host import router as signalr_router
+from app.signalr.metadata import start_stable_presence
+from app.signalr.metadata import stop_stable_presence
 from app.state.services import dispose
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    yield
-    await dispose()
+    # subscribe to bakenohana's presence channel so stable users show up for lazer
+    await start_stable_presence()
+    try:
+        yield
+    finally:
+        await stop_stable_presence()
+        await dispose()
 
 
 asgi_app = FastAPI(
