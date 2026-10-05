@@ -36,6 +36,7 @@ from __future__ import annotations
 from datetime import UTC
 from datetime import datetime
 from datetime import timedelta
+from typing import Any
 
 from fastapi import APIRouter
 from fastapi import Depends
@@ -298,22 +299,12 @@ async def get_seasonal_backgrounds() -> SeasonalBackgrounds:
     return SeasonalBackgrounds(ends_at=datetime.now(tz=UTC) + timedelta(days=1), backgrounds=[])
 
 
-@router.get("/users/")
-async def batch_get_users(
-    ids: list[int] = Query(default_factory=list, alias="ids[]"),
-    ruleset_id: int | None = Query(None),
-) -> JSONResponse:
-    """Batch users by id.
+async def _users_by_ids(ids: list[int], ruleset_id: int | None) -> dict[str, Any]:
+    """Shared body of the two batch user routes.
 
-    `GetUsersRequest` targets `users/?ids[]=` and `LookupUsersRequest` targets
-    `users/lookup/?ids[]=`. Both have a literal trailing slash, so the single-user
-    `/users/{lookup}/{ruleset}` route cannot match them. Not currently exercised
-    -- the client gets away with the single-user route -- but an online-user list
-    that needs more than one id will need this immediately.
-
-    Same `{"users": [...], "cursor": ...}` object shape as the beatmap batch,
-    not a bare array. Public rather than authenticated, matching the single-user
-    route, since a rendered user list is not private.
+    Both `GetUsersRequest` (`users/?ids[]=`) and `LookupUsersRequest`
+    (`users/lookup/?ids[]=`) bind `GetUsersResponse`, which is
+    `{"users": [...], "cursor": ...}` -- a bare array is not accepted.
     """
     batch = ids[:MAX_BATCH_IDS]
 
@@ -326,10 +317,49 @@ async def batch_get_users(
         # An explicit `ruleset_id` is the caller's choice and wins; otherwise fall
         # back to the user's effective mode, which is how the single-user route
         # resolves stat views (and honours stable's relax/autopilot preferences).
+        # lazer sends `ruleset_id` from `RealtimeUserList` purely to get
+        # `global_rank` back for sorting.
         mode = int(ruleset_id) if ruleset_id is not None else resolve_mode(user_id, row.preferred_mode)
         users.append((await _public_user(row, mode)).model_dump())
 
-    return JSONResponse(content={"users": users, "cursor": None})
+    return {"users": users, "cursor": None}
+
+
+# Declared before `/users/{lookup}/{ruleset}` so the literal `lookup` segment is
+# never captured as a username.
+@router.get("/users/lookup/")
+async def lookup_users(
+    ids: list[int] = Query(default_factory=list, alias="ids[]"),
+    ruleset_id: int | None = Query(None),
+) -> JSONResponse:
+    """`LookupUsersRequest` -- `users/lookup/?ids[]=`.
+
+    This is what feeds lazer's online-users list. `RealtimeUserList` collects the
+    ids from the presence stream and resolves them in batches of 50 through this
+    route before creating a panel per user.
+
+    The route did not exist, so every request 404'd. That failed *silently* on the
+    client: `OnlineLookupCache` resolves a missing batch to `null`, `RealtimeUserList`
+    then does `if (user == null) continue;`, and the panel list simply stays empty
+    with no toast, no error dialog and no failed-request log. Presence pushes were
+    arriving correctly the whole time and being thrown away one layer up.
+    """
+    return JSONResponse(content=await _users_by_ids(ids, ruleset_id))
+
+
+@router.get("/users/")
+async def batch_get_users(
+    ids: list[int] = Query(default_factory=list, alias="ids[]"),
+    ruleset_id: int | None = Query(None),
+) -> JSONResponse:
+    """`GetUsersRequest` -- `users/?ids[]=`.
+
+    Both routes have a literal trailing slash, so the single-user
+    `/users/{lookup}/{ruleset}` route cannot match them. Public rather than
+    authenticated, matching the single-user route, since a rendered user list is
+    not private.
+    """
+    return JSONResponse(content=await _users_by_ids(ids, ruleset_id))
 
 
 @router.get("/users/{lookup}/{ruleset}")

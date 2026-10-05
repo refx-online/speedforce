@@ -63,6 +63,86 @@ PROTOCOL_JSON = "json"
 PROTOCOL_MSGPACK = "messagepack"
 
 
+def encode_varint(value: int) -> bytes:
+    """LEB128, least-significant group first.
+
+    This is ``BinaryMessageFormatter.WriteLengthPrefix``: every byte but the last
+    has the high bit set, and it encodes how many groups follow. Real hub messages
+    are far larger than 127 bytes, so the multi-byte form is the common case here,
+    not an edge case.
+    """
+    if value < 0:
+        raise ValueError("varint length cannot be negative")
+
+    out = bytearray()
+
+    while True:
+        byte = value & 0x7F
+        value >>= 7
+
+        if value:
+            out.append(byte | 0x80)
+        else:
+            out.append(byte)
+            return bytes(out)
+
+
+def read_varint(buffer: bytes) -> tuple[int, int] | None:
+    """Decode a length prefix. Returns ``(value, consumed)`` or None if truncated.
+
+    ``None`` means "not enough bytes yet", which is the normal case for a message
+    arriving across several websocket frames.
+    """
+    value = 0
+    shift = 0
+
+    for i, byte in enumerate(buffer[:MAX_VARINT_BYTES]):
+        value |= (byte & 0x7F) << shift
+
+        if not byte & 0x80:
+            return value, i + 1
+
+        shift += 7
+
+    return None
+
+
+# ``BinaryMessageParser`` caps the prefix at 5 bytes (2GB payloads).
+MAX_VARINT_BYTES = 5
+
+
+# Logical hub-message field names. These are protocol-agnostic: the JSON codec
+# emits them as object keys and the MessagePack codec as array positions. Keeping
+# one vocabulary means the rest of the server never learns which wire format is in
+# use.
+FIELD_TYPE = "type"
+FIELD_HEADERS = "headers"
+FIELD_INVOCATION_ID = "invocationId"
+FIELD_TARGET = "target"
+FIELD_ARGUMENTS = "arguments"
+FIELD_ERROR = "error"
+FIELD_RESULT = "result"
+FIELD_ALLOW_RECONNECT = "allowReconnect"
+FIELD_STREAMS = "streams"
+
+# `MessagePackHubProtocolWorker.CompletionMessage` result kinds.
+RESULT_ERROR = 1
+RESULT_VOID = 2
+RESULT_NON_VOID = 3
+
+
+class _Void:
+    """Sentinel distinguishing "this method returns nothing" from "returns null"."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "VOID"
+
+
+VOID = _Void()
+
+
 class Codec:
     """Encodes hub messages for one negotiated hub protocol.
 
@@ -80,19 +160,46 @@ class Codec:
     def decode(self, raw: bytes) -> dict[str, Any]:
         raise NotImplementedError
 
-    async def send(self, websocket: WebSocket, payload: dict[str, Any]) -> None:
-        """Encode, frame and write one *message* in this protocol's transfer format.
+    def encode_message(self, message: dict[str, Any]) -> bytes:
+        """Encode a whole hub message (the envelope)."""
+        raise NotImplementedError
 
-        The single place that decides text vs binary. Note this is deliberately
-        not used for the handshake, which is JSON under every protocol -- see
+    def decode_message(self, raw: bytes) -> dict[str, Any]:
+        """Decode a whole hub message into the logical field vocabulary."""
+        raise NotImplementedError
+
+    async def send(self, websocket: WebSocket, message: dict[str, Any]) -> None:
+        """Encode, frame and write one *message* for this protocol's transfer format.
+
+        Note this is deliberately not used for the handshake, which is always
+        JSON delimited by ``0x1E`` regardless of transfer format -- see
         ``send_handshake``.
         """
-        frame = self.encode(payload) + RECORD_SEPARATOR
+        frame = self.frame(message)
 
         if self.binary:
             await websocket.send_bytes(frame)
         else:
             await websocket.send_text(frame.decode())
+
+    def frame(self, message: dict[str, Any]) -> bytes:
+        """Encode a message *with* its transfer-format framing.
+
+        The framing is a property of the transfer format, and the client derives
+        the transfer format from the hub protocol: ``JsonHubProtocol.TransferFormat``
+        is ``Text`` and ``MessagePackHubProtocol.TransferFormat`` is ``Binary``.
+        They are not independently choosable -- asking lazer to speak MessagePack
+        over the Text transfer format is not a configuration that exists.
+
+        ``encode_message`` is used rather than ``encode`` because the envelope shape
+        differs per protocol: JSON sends an object, MessagePack a positional array.
+        """
+        body = self.encode_message(message)
+
+        if self.binary:
+            return encode_varint(len(body)) + body
+
+        return body + RECORD_SEPARATOR
 
 
 class JSONCodec(Codec):
@@ -107,6 +214,14 @@ class JSONCodec(Codec):
         if not isinstance(value, dict):
             raise ValueError(f"expected a message map, got {type(value).__name__}")
         return value
+
+    def encode_message(self, message: dict[str, Any]) -> bytes:
+        # The JSON hub protocol's envelope is the object itself, so the logical
+        # field names are already the wire keys.
+        return self.encode(message)
+
+    def decode_message(self, raw: bytes) -> dict[str, Any]:
+        return self.decode(raw)
 
 
 class MessagePackCodec(Codec):
@@ -138,8 +253,145 @@ class MessagePackCodec(Codec):
     def decode(self, raw: bytes) -> dict[str, Any]:
         value = msgpack.unpackb(raw, raw=False, strict_map_key=False)
         if not isinstance(value, dict):
-            raise ValueError(f"expected a message map, got {type(value).__name__}")
+            raise ValueError(f"expected a payload map, got {type(value).__name__}")
         return value
+
+    # The MessagePack envelope is a **positional array**, not a map.
+    #
+    # `MessagePackHubProtocolWorker.ParseMessage` opens with `ReadArrayHeader()`
+    # before reading anything else, so a fixmap dies on its first byte:
+    #   "Unexpected msgpack code 129 (fixmap) encountered"
+    # Transcribed from that file's Write*/Create* pairs, which is the only place
+    # the layouts are defined:
+    #
+    #   Invocation        [1, headers, invocationId, target, arguments, streams]
+    #   StreamInvocation  [4, headers, invocationId, target, arguments, streams]
+    #   StreamItem        [2, headers, invocationId, item]
+    #   Completion        [3, headers, invocationId, resultKind(, error|result)]
+    #   CancelInvocation  [5, headers, invocationId]
+    #   Ping              [6]
+    #   Close             [7, error, allowReconnect]
+    #
+    # Written as data rather than as scattered `list.index(...)` calls so a test can
+    # assert the layout directly -- this is the fourth time the envelope shape has
+    # been wrong, and a declarative table is what makes it checkable.
+    ARRAY_LAYOUT: dict[int, tuple[str, ...]] = {
+        MSG_INVOCATION: (FIELD_TYPE, FIELD_HEADERS, FIELD_INVOCATION_ID, FIELD_TARGET, FIELD_ARGUMENTS, FIELD_STREAMS),
+        MSG_STREAM_INVOCATION: (
+            FIELD_TYPE,
+            FIELD_HEADERS,
+            FIELD_INVOCATION_ID,
+            FIELD_TARGET,
+            FIELD_ARGUMENTS,
+            FIELD_STREAMS,
+        ),
+        MSG_STREAM_ITEM: (FIELD_TYPE, FIELD_HEADERS, FIELD_INVOCATION_ID, FIELD_RESULT),
+        MSG_CANCEL_INVOCATION: (FIELD_TYPE, FIELD_HEADERS, FIELD_INVOCATION_ID),
+        MSG_CLOSE: (FIELD_TYPE, FIELD_ERROR, FIELD_ALLOW_RECONNECT),
+    }
+
+    def encode_message(self, message: dict[str, Any]) -> bytes:
+        kind = int(message.get(FIELD_TYPE, 0))
+
+        if kind == MSG_PING:
+            # PingMessage is the one-element array, nothing else.
+            return msgpack.packb([kind], use_bin_type=True)
+
+        if kind == MSG_COMPLETION:
+            return self._encode_completion(message)
+
+        layout = self.ARRAY_LAYOUT.get(kind)
+        if layout is None:
+            raise ValueError(f"no MessagePack array layout for message type {kind}")
+
+        return msgpack.packb([self._element(field, message) for field in layout], use_bin_type=True)
+
+    def _encode_completion(self, message: dict[str, Any]) -> bytes:
+        """Completion is variable-length: its tail depends on the result kind."""
+        error = message.get(FIELD_ERROR)
+        has_result = FIELD_RESULT in message
+
+        if error:
+            # ErrorResult: the array carries the message, never a result.
+            return msgpack.packb(
+                [
+                    MSG_COMPLETION,
+                    message.get(FIELD_HEADERS) or {},
+                    message.get(FIELD_INVOCATION_ID),
+                    RESULT_ERROR,
+                    error,
+                ],
+                use_bin_type=True,
+            )
+
+        if has_result:
+            return msgpack.packb(
+                [
+                    MSG_COMPLETION,
+                    message.get(FIELD_HEADERS) or {},
+                    message.get(FIELD_INVOCATION_ID),
+                    RESULT_NON_VOID,
+                    message.get(FIELD_RESULT),
+                ],
+                use_bin_type=True,
+            )
+
+        # VoidResult: the array stops after the kind. An extra nil here would be
+        # read as an argument and misparse.
+        return msgpack.packb(
+            [MSG_COMPLETION, message.get(FIELD_HEADERS) or {}, message.get(FIELD_INVOCATION_ID), RESULT_VOID],
+            use_bin_type=True,
+        )
+
+    def _element(self, field: str, message: dict[str, Any]) -> Any:
+        """Render one logical field for its array position."""
+        if field == FIELD_HEADERS:
+            # PackHeaders writes an empty map, not nil, when there are none.
+            return message.get(FIELD_HEADERS) or {}
+        if field == FIELD_ARGUMENTS:
+            return list(message.get(FIELD_ARGUMENTS) or [])
+        if field == FIELD_STREAMS:
+            # WriteStreamIds writes an empty array rather than omitting it.
+            return list(message.get(FIELD_STREAMS) or [])
+        if field == FIELD_INVOCATION_ID:
+            # An empty invocation id means "non-blocking" and is written as nil.
+            return message.get(field) or None
+        return message.get(field)
+
+    def decode_message(self, raw: bytes) -> dict[str, Any]:
+        """Decode a positional array back into the logical field vocabulary."""
+        value = msgpack.unpackb(raw, raw=False, strict_map_key=False)
+
+        if not isinstance(value, list) or not value:
+            raise ValueError(f"expected a message array, got {type(value).__name__}")
+
+        kind = value[0]
+
+        if kind == MSG_PING:
+            return {FIELD_TYPE: MSG_PING}
+
+        if kind == MSG_COMPLETION:
+            return self._decode_completion(value)
+
+        layout = self.ARRAY_LAYOUT.get(kind)
+        if layout is None:
+            raise ValueError(f"no MessagePack array layout for message type {kind}")
+
+        return {field: value[i] for i, field in enumerate(layout) if i < len(value)}
+
+    def _decode_completion(self, value: list[Any]) -> dict[str, Any]:
+        kind = value[3] if len(value) > 3 else RESULT_VOID
+        message: dict[str, Any] = {
+            FIELD_TYPE: MSG_COMPLETION,
+            FIELD_INVOCATION_ID: value[2] if len(value) > 2 else None,
+        }
+
+        if kind == RESULT_ERROR and len(value) > 4:
+            message[FIELD_ERROR] = value[4]
+        elif kind == RESULT_NON_VOID and len(value) > 4:
+            message[FIELD_RESULT] = value[4]
+
+        return message
 
 
 CODECS: dict[str, Codec] = {
@@ -199,8 +451,8 @@ class HubConnection:
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     _closed: bool = False
 
-    async def _write(self, payload: dict[str, Any]) -> None:
-        """Encode and send one hub message, framed with the record separator."""
+    async def _write(self, message: dict[str, Any]) -> None:
+        """Encode and send one hub message, framed for the negotiated format."""
         if self._closed:
             return
 
@@ -208,22 +460,39 @@ class HubConnection:
             if self._closed:
                 return
             try:
-                await self.codec.send(self.websocket, payload)
+                await self.codec.send(self.websocket, message)
             except (WebSocketDisconnect, RuntimeError):
                 self._closed = True
 
     async def send(self, target: str, *args: Any) -> None:
         """Push a hub method to the client (server -> client invocation)."""
-        await self._write({"type": MSG_INVOCATION, "target": target, "arguments": list(args)})
+        await self._write(
+            {
+                FIELD_TYPE: MSG_INVOCATION,
+                FIELD_TARGET: target,
+                FIELD_ARGUMENTS: list(args),
+            }
+        )
 
-    async def complete(self, invocation_id: str, result: Any = None, error: str | None = None) -> None:
-        """Reply to a client -> server invocation that expects a completion."""
-        payload: dict[str, Any] = {"type": MSG_COMPLETION, "invocationId": invocation_id, "error": error}
+    async def complete(self, invocation_id: str, result: Any = VOID, error: str | None = None) -> None:
+        """Reply to a client -> server invocation that expects a completion.
 
-        if error is None:
-            payload["result"] = result
+        ``result`` defaults to :data:`VOID` rather than ``None`` because the two
+        are different on the wire. A void completion is ``[3, {}, id, 2]`` and
+        stops there; a completion whose result happens to be null is
+        ``[3, {}, id, 3, nil]``. Sending the non-void form for a void method makes
+        the client read one argument too many.
+        """
+        message: dict[str, Any] = {
+            FIELD_TYPE: MSG_COMPLETION,
+            FIELD_INVOCATION_ID: invocation_id,
+            FIELD_ERROR: error,
+        }
 
-        await self._write(payload)
+        if error is None and result is not VOID:
+            message[FIELD_RESULT] = result
+
+        await self._write(message)
 
     async def ping(self) -> None:
         """Answer a client keepalive with a keepalive.
@@ -231,7 +500,7 @@ class HubConnection:
         A Ping carries no invocationId, so replying with a Completion (even an
         empty one) is not protocol-correct and a strict client can object to it.
         """
-        await self._write({"type": MSG_PING})
+        await self._write({FIELD_TYPE: MSG_PING})
 
     def close(self) -> None:
         self._closed = True
@@ -299,22 +568,23 @@ def negotiate_payload(
     payload: dict[str, Any] = {
         "connectionId": token.connection_id,
         "connectionToken": token.connection_id,
-        # **Text only, deliberately.**
+        # Both transfer formats, and **both are implemented**:
+        # `Codec.frame` delimits Text with 0x1E and prefixes Binary with a VarInt
+        # length, mirroring `TextMessageFormatter` / `BinaryMessageFormatter`.
         #
-        # ASP.NET SignalR has two framings: the Text transfer format delimits
-        # messages with the 0x1E record separator (`TextMessageParser`), while the
-        # Binary transfer format uses a VarInt length prefix instead
-        # (`BinaryMessageParser` -- no 0x1E at all). We implement the Text framing
-        # only, and `Codec.send` terminates every frame with 0x1E to match it.
-        #
-        # Advertising "Binary" here would let a client negotiate the length-prefix
-        # framing, which we do not implement, and it would then mis-parse every
-        # message. The client picks the *first* supported format it wants, and its
-        # default request is Text, so this is a no-op for lazer -- it just makes the
-        # one framing we support the only one on offer.
+        # An earlier note here advertised Text only, on the reasoning that the
+        # client's default request is Text. That was wrong: the transfer format is
+        # *derived* from the hub protocol (`MessagePackHubProtocol.TransferFormat`
+        # is Binary), so a client speaking MessagePack always takes Binary and
+        # declining it makes the combination impossible:
+        #   "The transport does not support the 'Binary' transfer format."
+        # Worse, serving 0x1E to a Binary-framed client explains the original
+        # 30s `ServerTimeout`: `BinaryMessageParser` reads `{` (0x7B = 123) as a
+        # length and waits for 123 bytes that never arrive.
         "availableTransports": [
-            {"transport": "WebSockets", "transferFormats": ["Text"]},
+            {"transport": "WebSockets", "transferFormats": ["Text", "Binary"]},
         ],
+        "transferFormat": "Binary",
         "supportedProtocols": list(SUPPORTED_PROTOCOLS),
     }
 
@@ -356,5 +626,62 @@ async def send_handshake(websocket: WebSocket, error: str | None = None) -> None
 
 
 def parse(codec: Codec, payload: bytes) -> dict[str, Any]:
-    """Decode one unframed hub message. Raises on malformed input."""
-    return codec.decode(payload)
+    """Decode one unframed hub message. Raises on malformed input.
+
+    Decodes the *envelope*, so the JSON codec yields a message object and the
+    MessagePack codec yields the positional array the client's
+    ``ReadArrayHeader()`` expects.
+    """
+    return codec.decode_message(payload)
+
+
+class FrameReader:
+    """Reassembles transfer-format-framed hub messages from a byte stream.
+
+    A websocket frame does not have to align with a SignalR message, so partial
+    data is buffered until a whole message is available. The framing is the codec's,
+    because it follows the transfer format:
+
+    * **Text** -- each message ends with ``0x1E``.
+    * **Binary** -- each message is preceded by a VarInt byte length and has no
+      terminator.
+
+    Binary framing matters here for a second reason: ``0x1E`` is also a valid
+    msgpack positive fixint (30), so splitting on it corrupts any payload that
+    contains that byte. Length-prefix framing has no such hazard, which is exactly
+    why the client uses it for MessagePack.
+    """
+
+    def __init__(self, codec: Codec) -> None:
+        self._codec = codec
+        self._buffer = b""
+
+    def feed(self, data: bytes) -> list[bytes]:
+        """Add received bytes and return every complete message now available."""
+        self._buffer += data
+        messages: list[bytes] = []
+
+        while True:
+            if self._codec.binary:
+                header = read_varint(self._buffer)
+
+                if header is None:
+                    # truncated prefix, or more than MAX_VARINT_BYTES -- wait
+                    return messages
+
+                length, consumed = header
+
+                if len(self._buffer) < consumed + length:
+                    return messages
+
+                messages.append(self._buffer[consumed : consumed + length])
+                self._buffer = self._buffer[consumed + length :]
+                continue
+
+            separator = self._buffer.find(RECORD_SEPARATOR)
+
+            if separator < 0:
+                return messages
+
+            messages.append(self._buffer[:separator])
+            self._buffer = self._buffer[separator + 1 :]

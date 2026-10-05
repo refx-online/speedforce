@@ -15,6 +15,8 @@ single instance but means the room list is not durable; see notes.md.
 
 from __future__ import annotations
 
+import asyncio
+
 import itertools
 import time
 from dataclasses import dataclass
@@ -408,6 +410,7 @@ class MultiplayerRoom:
         which is why the order is spelled out member by member.
         """
         host = self.users.get(self.host_id)
+
         return {
             0: self.room_id,  # RoomID
             1: _ROOM_STATE[self.state],  # State
@@ -420,7 +423,7 @@ class MultiplayerRoom:
             8: self.room_id,  # ChannelID
         }
 
-    def summary(self) -> dict[str, Any]:
+    async def summary(self) -> dict[str, Any]:
         """The trimmed payload for the REST room list (`Room`, not `MultiplayerRoom`).
 
         The lounge list is a `GET /api/v2/rooms` REST call
@@ -439,6 +442,20 @@ class MultiplayerRoom:
         genuinely different wire formats binding different DTOs.
         """
         host = self.users.get(self.host_id)
+
+        # `_public_user` is async, so this has to be async too. It was a plain
+        # `def` that built the coroutines into the payload unawaited, and
+        # `JSONResponse` turned them into
+        # `TypeError: Object of type coroutine is not JSON serializable`
+        # -- a plain-text 500 for `GET /api/v2/rooms`.
+        #
+        # It only bit once a room had members: empty `users` yields `[]` and
+        # `None`, both of which serialise fine. That is why the empty room list
+        # returned 200 and every populated one failed, which reads exactly like
+        # a race and is not one.
+        participants = await asyncio.gather(*(_public_user(u.user_id) for u in self.users.values()))
+        host_public = await _public_user(host.user_id) if host else None
+
         return {
             "id": self.room_id,
             "name": self.settings.name,
@@ -453,8 +470,8 @@ class MultiplayerRoom:
             "participant_count": len(self.users),
             # Room exposes participants through recent_participants; there is no
             # `participants` field on it at all.
-            "recent_participants": [_public_user(u.user_id) for u in self.users.values()],
-            "host": _public_user(host.user_id) if host else None,
+            "recent_participants": list(participants),
+            "host": host_public,
             "playlist": [i.to_rest() for i in self.playlist],
             "playlist_item_stats": None,
             "difficulty_range": None,

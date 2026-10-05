@@ -180,20 +180,32 @@ class MetadataHub:
 
         return None
 
-    async def _get_changes_since(self, queue_id: int) -> dict[str, Any]:
+    async def _get_changes_since(self, queue_id: int) -> dict[int, Any]:
         """Queue cursor for reconnect catch-up.
 
-        Field names must match ``osu.Game/Online/Metadata/BeatmapUpdates.cs``:
-        ``BeatmapSetIDs`` and ``LastProcessedQueueID``. Returning anything else
-        fails deserialisation during connect, which leaves the client stuck on
-        "signing in" forever -- no further hub calls ever happen.
+        `BeatmapUpdates` is a `[MessagePackObject]`, so the map is **positional**:
+        the resolver looks members up by `Key(N)` ordinal and field *names never
+        reach the wire*.
+
+            [Key(0)] int[] BeatmapSetIDs
+            [Key(1)] int   LastProcessedQueueID
+
+        Returning `{"beatmapSetIDs": ..., "lastProcessedQueueID": ...}` made the
+        client report
+
+            Error trying to deserialize result to BeatmapUpdates.
+            Deserializing object of the `BeatmapUpdates` type for 'argument' failed.
+
+        during connect, which aborts the catch-up pass. The old docstring here
+        asserted the opposite premise ("field names must match"), and the
+        resulting error was the one it warned about.
 
         A full deployment keeps an append-only change log keyed by this id. Here
         the cursor only advances: enough for the reconnect path to complete
         without replaying changes already applied.
         """
         r = await self.redis()
-        return {"beatmapSetIDs": [], "lastProcessedQueueID": int(await r.get(QUEUE_KEY) or 0)}
+        return {0: [], 1: int(await r.get(QUEUE_KEY) or 0)}
 
     async def broadcast(self, user_id: int) -> None:
         """Push one user's presence to every connection watching them."""

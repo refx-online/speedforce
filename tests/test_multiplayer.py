@@ -179,6 +179,24 @@ async def main() -> int:
         R = ik(room)
         check("room map keys are 0..8", sorted(R.keys()) == list(range(9)), f"got {sorted(R.keys())}")
         check("room name is Settings -> Name", R[2][0] == "re;fx test", str(R.get(2)))
+
+        # The same thing, but the way a real MPv2 client sends it: `MatchSettings`
+        # is `Key(0)` of `MultiplayerRoom`, so the nested map is under an integer
+        # key, not the string "Settings". `_parse_settings` only understood the
+        # named form, so a live room came back titled
+        # "{0: 'my room', 1: 0, ...}" -- the name stringified, because the room map
+        # itself was being read as the settings map.
+        from app.signalr.multiplayer import _parse_settings
+
+        int_keyed = _parse_settings({0: {0: "int keyed", 1: 5649109, 7: 4}, 1: None})
+        check("integer-keyed room settings yield the name", int_keyed.name == "int keyed", repr(int_keyed.name))
+        check("integer-keyed room settings yield MaxPlayers", int_keyed.max_players == 4, repr(int_keyed.max_players))
+        check(
+            "integer-keyed room settings yield the beatmap", int_keyed.beatmap_id == 5649109, repr(int_keyed.beatmap_id)
+        )
+
+        bare = _parse_settings({0: "bare settings", 1: 5649109, 7: 4})
+        check("a bare settings map is not mistaken for a room", bare.name == "bare settings", repr(bare.name))
         check("room state is an enum int, not a name", R[1] in (0, 1, 2, 3), repr(R.get(1)))
         check("playlist seeded with the beatmap", len(R[6]) == 1, str(R.get(6)))
         check("creator is host", bool(R[4]) and R[4][0] > 0, str(R.get(4)))

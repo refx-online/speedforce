@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+
 import datetime
 import os
 
@@ -292,4 +294,7 @@ async def beatmap_scores(
 # than in the hub because it is polled on entry to the lounge.
 @router.get("/rooms")
 async def list_rooms() -> JSONResponse:
-    return JSONResponse(content=[room.summary() for room in multiplayer_rooms.values()])
+    # `summary()` is async (it resolves participants), so the list has to be
+    # gathered rather than built with a comprehension.
+    summaries = await asyncio.gather(*(room.summary() for room in multiplayer_rooms.values()))
+    return JSONResponse(content=list(summaries))

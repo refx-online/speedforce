@@ -12,7 +12,6 @@ import contextlib
 from typing import Any
 from typing import Protocol
 
-import msgpack
 from fastapi import APIRouter
 from fastapi import Query
 from fastapi import Request
@@ -254,22 +253,12 @@ async def _keepalive(connection: HubConnection) -> None:
 async def _pump(websocket: WebSocket, hub: HubHandler, connection: HubConnection) -> None:
     """Read framed messages until the socket closes.
 
-    Buffering matters: a websocket frame does not have to align with a SignalR
-    message, so an incomplete tail is carried over to the next read. Which
-    protocol decides how that is done:
-
-    * **JSON** -- accumulate bytes and split on the record separator. Safe,
-      because a JSON payload is UTF-8 text and cannot contain a raw ``0x1e``.
-    * **MessagePack** -- hand the bytes to a streaming ``Unpacker``, which
-      tracks msgpack structure and so knows where a message ends. Splitting on
-      the separator instead would be wrong in a way that is easy to miss:
-      ``0x1e`` is a valid msgpack positive fixint (30), and a *string value*
-      containing that byte would be split in half. The ``Unpacker`` also holds
-      its own incomplete tail, so nothing is lost between reads.
+    Framing is entirely `FrameReader`'s job, driven by the negotiated codec's
+    transfer format -- see `protocol.FrameReader` for why Binary cannot be split
+    on `0x1E`. This loop only moves bytes and hands whole messages to the
+    dispatcher.
     """
-    codec = connection.codec
-    unpacker = msgpack.Unpacker(raw=False, strict_map_key=False) if codec.binary else None
-    buffer = b""
+    reader = protocol.FrameReader(connection.codec)
 
     while True:
         try:
@@ -280,32 +269,19 @@ async def _pump(websocket: WebSocket, hub: HubHandler, connection: HubConnection
         if received is None:
             continue
 
-        if unpacker is not None:
-            unpacker.feed(received[0])
-            for message in unpacker:
-                # Between messages the stream carries the 0x1e record separator,
-                # which the Unpacker faithfully decodes as a bare positive
-                # fixint. A real hub message is always a map, so a non-map at
-                # the top level is framing, not payload.
-                if isinstance(message, dict):
-                    await _dispatch(hub, connection, message)
-            continue
-
-        buffer += received[0]
-
-        while protocol.RECORD_SEPARATOR in buffer:
-            frame, _, buffer = buffer.partition(protocol.RECORD_SEPARATOR)
-            if not frame:
-                continue
+        for payload in reader.feed(received[0]):
             try:
-                message = codec.decode(frame)
-            except Exception:  # noqa: BLE001 - a malformed frame is dropped, not fatal
+                # decode the *envelope*: under MessagePack that is the positional
+                # array the client's ReadArrayHeader() expects, so this cannot use
+                # the payload-only decoder.
+                message = protocol.parse(connection.codec, payload)
+            except Exception:  # noqa: BLE001 - a malformed message is dropped, not fatal
                 continue
             await _dispatch(hub, connection, message)
 
 
 async def _dispatch(hub: HubHandler, connection: HubConnection, message: dict[str, Any]) -> None:
-    msg_type = message.get("type")
+    msg_type = message.get(protocol.FIELD_TYPE)
 
     # keepalive: answered with a Ping, which is what the spec calls for
     if msg_type == protocol.MSG_PING:
@@ -313,9 +289,9 @@ async def _dispatch(hub: HubHandler, connection: HubConnection, message: dict[st
         return
 
     if msg_type == protocol.MSG_INVOCATION:
-        target = str(message.get("target") or "")
-        args = message.get("arguments") or []
-        invocation_id = message.get("invocationId")
+        target = str(message.get(protocol.FIELD_TARGET) or "")
+        args = message.get(protocol.FIELD_ARGUMENTS) or []
+        invocation_id = message.get(protocol.FIELD_INVOCATION_ID)
 
         try:
             result = await hub.invoke(connection, target, list(args))

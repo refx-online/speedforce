@@ -494,7 +494,21 @@ def _parse_settings(raw: Any):
     from app.signalr.rooms import RoomSettings
 
     source: dict[str, Any] = raw if isinstance(raw, dict) else {}
-    nested = source.get("Settings")
+
+    # A client may send either the room or the settings on their own:
+    #   * JSON hub protocol  -> {"Settings": {...}, ...}
+    #   * MessagePack        -> {0: {0: "name", ...}, ...}, since `MatchSettings` is
+    #                          `Key(0)` of `MultiplayerRoom` (g0v0 reference)
+    # Only descend when the candidate is a **map**, which keeps the two apart: a
+    # bare settings dict has a string at Key(0) (the name), never a nested map.
+    #
+    # Without the integer arm, a real MPv2 client's room arrives as the settings
+    # map itself, so the name is read from Key(0) and stringified --
+    # rooms appear titled "{0: 'my room', 1: 0, ...}" instead of "my room".
+    nested = _get(source, 0, "Settings")
+    if not isinstance(nested, dict):
+        nested = None
+
     settings: dict[str, Any] = nested if isinstance(nested, dict) else source
 
     def field(int_key: int, *names: str, default: Any = "") -> Any:
