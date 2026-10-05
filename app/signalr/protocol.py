@@ -45,6 +45,8 @@ import msgpack
 from starlette.websockets import WebSocket
 from starlette.websockets import WebSocketDisconnect
 
+from app.signalr import wire
+
 # Record separator. Every SignalR message on the wire ends with this byte.
 RECORD_SEPARATOR = b"\x1e"
 
@@ -175,8 +177,14 @@ class Codec:
         JSON delimited by ``0x1E`` regardless of transfer format -- see
         ``send_handshake``.
         """
-        frame = self.frame(message)
+        await self.write_frame(websocket, self.frame(message))
 
+    async def write_frame(self, websocket: WebSocket, frame: bytes) -> None:
+        """Write an already-encoded frame using this codec's transport.
+
+        Split out from :meth:`send` so a caller that wants to observe the exact
+        bytes on the wire -- the wire logger -- can encode once, log, then write.
+        """
         if self.binary:
             await websocket.send_bytes(frame)
         else:
@@ -460,7 +468,16 @@ class HubConnection:
             if self._closed:
                 return
             try:
-                await self.codec.send(self.websocket, message)
+                frame = self.codec.frame(message)
+                wire.frame(
+                    "out",
+                    self.hub,
+                    self.connection_id,
+                    frame,
+                    _decode_for_log(self.codec, frame),
+                    note=_describe_message(message),
+                )
+                await self.codec.write_frame(self.websocket, frame)
             except (WebSocketDisconnect, RuntimeError):
                 self._closed = True
 
@@ -623,6 +640,47 @@ async def send_handshake(websocket: WebSocket, error: str | None = None) -> None
     payload = {"error": error} if error else {}
     frame = json.dumps(payload).encode() + RECORD_SEPARATOR
     await websocket.send_text(frame.decode())
+
+
+def _decode_for_log(codec: Codec, frame: bytes) -> Any:
+    """Best-effort decode of an outbound frame, for the wire log only.
+
+    Never raises: the log must not be able to break a connection.
+    """
+    if codec.binary:
+        # strip the VarInt length prefix before decoding the envelope
+        header = read_varint(frame)
+        if header is None:
+            return None
+        _, consumed = header
+        frame = frame[consumed:]
+
+    if codec.binary:
+        try:
+            import msgpack as _msgpack
+
+            return _msgpack.unpackb(frame, raw=False, strict_map_key=False)
+        except Exception as exc:  # noqa: BLE001 - diagnostics only
+            return exc
+
+    try:
+        return json.loads(frame.decode("utf-8", "replace"))
+    except Exception as exc:  # noqa: BLE001 - diagnostics only
+        return exc
+
+
+def _describe_message(message: dict[str, Any]) -> str:
+    """Name the hub method an outbound envelope carries, for the wire log."""
+    kind = message.get(FIELD_TYPE)
+
+    if kind == MSG_INVOCATION:
+        return f"invocation {message.get(FIELD_TARGET)}"
+    if kind == MSG_COMPLETION:
+        return "completion"
+    if kind == MSG_PING:
+        return "ping"
+
+    return ""
 
 
 def parse(codec: Codec, payload: bytes) -> dict[str, Any]:

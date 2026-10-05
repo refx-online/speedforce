@@ -20,6 +20,7 @@ from fastapi.responses import JSONResponse
 from starlette.websockets import WebSocketDisconnect
 
 from app.signalr import protocol
+from app.signalr import wire
 from app.signalr.protocol import HubConnection
 from app.signalr.protocol import NegotiationError
 
@@ -64,6 +65,7 @@ def mount(hub: HubHandler) -> None:
 
     Called at import time from the module that implements the hub.
     """
+    wire.configure()
     registry.register(hub)
 
     @router.post(f"/signalr/{hub.name}/negotiate")
@@ -275,9 +277,46 @@ async def _pump(websocket: WebSocket, hub: HubHandler, connection: HubConnection
                 # array the client's ReadArrayHeader() expects, so this cannot use
                 # the payload-only decoder.
                 message = protocol.parse(connection.codec, payload)
-            except Exception:  # noqa: BLE001 - a malformed message is dropped, not fatal
+            except Exception as exc:  # noqa: BLE001 - a malformed message is dropped, not fatal
+                # Logged because this `continue` is invisible: a frame the client
+                # sent that we cannot parse is dropped in total silence, which is
+                # how a client->server invocation can fail without a trace.
+                wire.frame(
+                    "in",
+                    connection.hub,
+                    connection.connection_id,
+                    payload,
+                    exc,
+                    note="UNDECODABLE - dropped",
+                )
                 continue
+
+            wire.frame(
+                "in",
+                connection.hub,
+                connection.connection_id,
+                payload,
+                message,
+                note=_describe_inbound(message),
+            )
             await _dispatch(hub, connection, message)
+
+
+def _describe_inbound(message: dict[str, Any]) -> str:
+    """Name the hub method an inbound envelope invokes, for the wire log."""
+    kind = message.get(protocol.FIELD_TYPE)
+
+    if kind == protocol.MSG_INVOCATION:
+        target = message.get(protocol.FIELD_TARGET)
+        args = message.get(protocol.FIELD_ARGUMENTS) or []
+        return f"invocation {target} argc={len(args)}"
+
+    if kind == protocol.MSG_PING:
+        return "ping"
+    if kind == protocol.MSG_COMPLETION:
+        return "completion"
+
+    return ""
 
 
 async def _dispatch(hub: HubHandler, connection: HubConnection, message: dict[str, Any]) -> None:
@@ -304,7 +343,12 @@ async def _dispatch(hub: HubHandler, connection: HubConnection, message: dict[st
             return
 
         if invocation_id:
-            await connection.complete(str(invocation_id), result)
+            # A hub method that returns nothing is VoidResult on the wire
+            # ([3, {}, id, 2]); sending NonVoidResult with a nil result
+            # ([3, {}, id, 3, nil]) tells the client the method has a return
+            # value it did not get. None is how every void method in these hubs
+            # reports success, so it maps to VOID rather than to a null result.
+            await connection.complete(str(invocation_id), protocol.VOID if result is None else result)
         return
 
     if msg_type == protocol.MSG_CLOSE:
