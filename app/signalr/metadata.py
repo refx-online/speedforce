@@ -52,6 +52,11 @@ _LOG = logging.getLogger(__name__)
 # vanishes without a clean disconnect stops reading as online.
 PRESENCE_TTL_SECONDS = 90
 
+# Must be comfortably *inside* the TTL, for the same reason bakenohana's
+# housekeeping was moved off 100s: a refresher slower than the timeout it is
+# keeping alive is not a refresher.
+PRESENCE_KEEPALIVE_INTERVAL_SECONDS = 30
+
 
 class MetadataHub:
     name = "metadata"
@@ -548,17 +553,68 @@ class StablePresenceListener:
 
 
 _listener: StablePresenceListener | None = None
+_keepalive: asyncio.Task[None] | None = None
+
+
+async def _presence_keepalive() -> None:
+    """Keep lazer presences from expiring while their connections are open.
+
+    `PRESENCE_TTL_SECONDS` is a safety net for crashed servers, but lazer only
+    sends `UpdateActivity`/`UpdateStatus` on *state changes* -- the ~1/s traffic
+    is `Ping` -- so an idle lazer client never rewrites its own document. Without
+    this the key expires 90s after connect and the user stops existing for
+    everyone: they vanish from their own online list, and from stable's.
+
+    This is the same bug that was fixed on the bakenohana side for stable
+    presences, one layer over. Both ends of the bridge need it.
+
+    Deliberately does not publish when the key is merely alive. The document is
+    unchanged, so re-broadcasting every connected user to every watcher on every
+    tick would be a fan-out storm for no visible difference; only a missing key
+    is republished, since that genuinely is a change watchers have not seen.
+    """
+    while True:
+        await asyncio.sleep(PRESENCE_KEEPALIVE_INTERVAL_SECONDS)
+
+        try:
+            r = await hub.redis()
+            connections = list(hub._live)  # noqa: SLF001 - same module, deliberate
+        except Exception:  # noqa: BLE001 - never let this loop kill the process
+            continue
+
+        for connection in connections:
+            key = PRESENCE_KEY.format(user_id=connection.user_id)
+
+            try:
+                if await r.exists(key):
+                    await r.expire(key, PRESENCE_TTL_SECONDS)
+                    continue
+
+                stored = _loads(await r.get(key))
+                if isinstance(stored, dict) and stored:
+                    # key expired underneath us; re-establish it and tell watchers
+                    await r.set(key, json.dumps(stored), ex=PRESENCE_TTL_SECONDS)
+                    await hub.broadcast(connection.user_id)
+            except Exception:  # noqa: BLE001 - one bad connection is not fatal
+                continue
 
 
 async def start_stable_presence() -> None:
-    global _listener
+    global _listener, _keepalive
     if _listener is None:
         _listener = StablePresenceListener(hub)
     await _listener.start()
+    if _keepalive is None:
+        _keepalive = asyncio.create_task(_presence_keepalive())
 
 
 async def stop_stable_presence() -> None:
-    global _listener
+    global _listener, _keepalive
+    if _keepalive is not None:
+        _keepalive.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await _keepalive
+        _keepalive = None
     if _listener is not None:
         await _listener.stop()
         _listener = None
