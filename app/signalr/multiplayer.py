@@ -390,13 +390,19 @@ def _user(connection: HubConnection):
 
 
 def _get(source: Any, int_key: int, str_key: str, default: Any = None) -> Any:
-    """Read a field from a hub payload by integer key, falling back to name.
+    """Read a field from a hub payload by position or by name.
 
-    Hub payloads are **integer-keyed** (MessagePack `[Key(N)]`), so the integer
-    is the real key and the name only appears when the JSON hub protocol is in
-    use, where object keys are strings. Accepting both keeps one set of parsers
-    usable from tests and from the real client.
+    A `[MessagePackObject]` with `[Key(N)]` integer members arrives as a
+    **positional array** -- confirmed against the real client, which sends
+    `CreateRoom [[0, 0, ["name", 0, "", 1, 0, 0, false, nil], ...]`. The same
+    payload is authored here as an int-keyed dict and rewritten by
+    ``protocol.positionalise`` on the way out, so both spellings have to parse:
+    array from a client, dict from our own code and from the JSON hub protocol
+    (where keys are strings).
     """
+    if isinstance(source, (list, tuple)):
+        return source[int_key] if -len(source) <= int_key < len(source) else default
+
     if not isinstance(source, dict):
         return default
 
@@ -489,48 +495,76 @@ async def _hydrate_playlist_items(items) -> None:
         item.star_rating = float(row.diff)
 
 
+# `MultiplayerRoomSettings` (osu.Game/Online/Multiplayer/MultiplayerRoomSettings.cs):
+#   0 Name  1 PlaylistItemId  2 Password  3 MatchType
+#   4 QueueMode  5 AutoStartDuration  6 AutoSkip  7 MaxParticipants
+#
+# There is no beatmap or ruleset field here at all -- the beatmap lives on the
+# playlist item. Reading 1 as a beatmap id and 4 as a ruleset id (which is what
+# this did) picked up PlaylistItemId and the QueueMode enum instead.
+_SETTINGS_FIELDS = (
+    "Name",
+    "PlaylistItemId",
+    "Password",
+    "MatchType",
+    "QueueMode",
+    "AutoStartDuration",
+    "AutoSkip",
+    "MaxParticipants",
+)
+
+
 def _parse_settings(raw: Any):
-    """Accept either the client's room dict or an already-parsed settings dict."""
+    """Read `MultiplayerRoomSettings` out of whatever the client sent.
+
+    Accepted shapes:
+      * a bare settings object, positional or int-keyed
+      * a whole `MultiplayerRoom`, where settings is ``Key(2)``
+      * the JSON hub protocol's ``{"Settings": {...}}``
+
+    Observed from the real client (SIGNALR_WIRE_LOG):
+
+        [0, 0, ["kaupec2's awesome room", 0, "", 1, 0, 0, false, nil], [], nil, nil, [...], [], 0]
+         ^  ^  ^ 0 Name                                                     ^ 7 MaxParticipants
+               ^ Key(2) Settings
+
+    Settings is at **index 2**, not 0, which is why reading it positionally as if
+    it were the room gave an unnamed room.
+    """
     from app.signalr.rooms import RoomSettings
 
-    source: dict[str, Any] = raw if isinstance(raw, dict) else {}
+    settings = raw
 
-    # A client may send either the room or the settings on their own:
-    #   * JSON hub protocol  -> {"Settings": {...}, ...}
-    #   * MessagePack        -> {0: {0: "name", ...}, ...}, since `MatchSettings` is
-    #                          `Key(0)` of `MultiplayerRoom` (g0v0 reference)
-    # Only descend when the candidate is a **map**, which keeps the two apart: a
-    # bare settings dict has a string at Key(0) (the name), never a nested map.
-    #
-    # Without the integer arm, a real MPv2 client's room arrives as the settings
-    # map itself, so the name is read from Key(0) and stringified --
-    # rooms appear titled "{0: 'my room', 1: 0, ...}" instead of "my room".
-    nested = _get(source, 0, "Settings")
-    if not isinstance(nested, dict):
-        nested = None
+    if isinstance(settings, (list, tuple)):
+        # A bare settings array is 8 long; a room array carries settings at 2.
+        candidate = settings[2] if len(settings) > 2 and isinstance(settings[2], (list, dict)) else settings
+        settings = candidate
+    elif isinstance(settings, dict):
+        nested = _get(settings, 2, "Settings")
+        if isinstance(nested, (list, dict)):
+            settings = nested
 
-    settings: dict[str, Any] = nested if isinstance(nested, dict) else source
-
-    def field(int_key: int, *names: str, default: Any = "") -> Any:
-        value = _get(settings, int_key, "", None)
+    def field(index: int, *names: str, default: Any = "") -> Any:
+        value = _get(settings, index, "", None)
 
         if value is not None:
             return value
 
-        for name in names:
-            if name in settings:
-                return settings[name]
+        if isinstance(settings, dict):
+            for name in names:
+                if name in settings:
+                    return settings[name]
 
         return default
 
     return RoomSettings(
         name=str(field(0, "Name", "name") or "")[:50],
         password=field(2, "Password", "password") or None,
-        beatmap_id=int(field(1, "BeatmapId", "beatmap_id", "PlaylistItemId") or 0),
-        beatmap_md5=str(field(3, "BeatmapMD5", "beatmap_md5") or ""),
-        ruleset_id=int(field(4, "RulesetId", "ruleset_id") or 0),
-        mods=field(5, "Mods", "mods", default=[]) or [],
-        max_players=int(field(7, "MaxPlayers", "MaxParticipants", "max_players") or 16),
+        beatmap_id=int(field(1, "PlaylistItemId", "BeatmapId", "beatmap_id") or 0),
+        beatmap_md5="",
+        ruleset_id=0,
+        mods=[],
+        max_players=int(field(7, "MaxParticipants", "MaxPlayers", "max_players") or 16),
     )
 
     # hub methods that exist on the client but are deliberately not implemented; they

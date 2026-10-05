@@ -81,10 +81,25 @@ class MetadataHub:
         self._live.add(connection)
 
         r = await self.redis()
-        # ChoosingBeatmap is UserActivity's idle-ish default (union 11)
+        # Seed a complete presence document in the *stored* shape -- the same
+        # shape bakenohana's bridge writes -- because `presence_to_client` reads
+        # it. It used to be seeded as a bare activity (`{"type": ...}`), which
+        # has no `Status`, so the user read as "no status" and a later
+        # UpdateActivity merged on top of a document that still had none.
+        #
+        # ChoosingBeatmap (union 11) is the idle-ish default the client itself
+        # sends on connect. Status defaults to Online: lazer sends `UpdateStatus`
+        # immediately after connecting, but until it does, the reference also
+        # treats a connected user as visible.
+        document = {
+            "Activity": {"type": "ChoosingBeatmap"},
+            "Status": "Online",
+            "rulesetId": 0,
+            "client": "lazer",
+        }
         await r.set(
             PRESENCE_KEY.format(user_id=connection.user_id),
-            json.dumps({"type": "ChoosingBeatmap"}),
+            json.dumps(document),
             ex=PRESENCE_TTL_SECONDS,
         )
         await self.broadcast(connection.user_id)
@@ -106,7 +121,7 @@ class MetadataHub:
 
     async def invoke(self, connection: HubConnection, target: str, args: list[Any]) -> Any:
         if target in ("UpdateActivity", "UpdateStatus"):
-            return await self._update_presence(connection, args[0] if args else None)
+            return await self._update_presence(connection, target, args[0] if args else None)
 
         if target == "BeginWatchingUserPresence":
             return await self._begin_watching(connection)
@@ -132,20 +147,51 @@ class MetadataHub:
 
     # ------------------------------------------------------------------ pieces
 
-    async def _update_presence(self, connection: HubConnection, payload: Any) -> None:
-        """Store a client's activity/status verbatim, then notify watchers.
+    async def _update_presence(self, connection: HubConnection, target: str, payload: Any) -> None:
+        """Merge one half of a presence, then notify watchers.
 
-        ``null`` is meaningful: it is how the client says it has gone idle, and we
-        drop the entry so the user stops reading as online.
+        `IMetadataServer` has **two** separate methods, `UpdateActivity` and
+        `UpdateStatus`, and lazer calls both right after connecting
+        (`OnlineMetadataClient.cs:124-128`). Each carries only its own half: the
+        activity is a `UserActivity` union array, the status is a bare
+        `UserStatus` ordinal.
+
+        Treating either as the whole document loses the other. Captured with
+        SIGNALR_WIRE_LOG while both clients were connected::
+
+            UpdateActivity [[12, [5333124, "Sewerslvt - ...", 0, "Clicking circles"]]]
+            UpdateStatus   [2]
+
+        Storing those verbatim left `signalr:presence:77` holding the bare
+        string `2`, which `presence_to_client` rejects as not-a-dict -- so the
+        lazer user's own presence resolved to offline and they were dropped from
+        every list. The reference keeps both halves in one `PlayerState`; so does
+        this now.
         """
         r = await self.redis()
         key = PRESENCE_KEY.format(user_id=connection.user_id)
 
-        if payload is None:
+        # keep whatever the other method last wrote, so a status update does not
+        # discard the activity (and vice versa)
+        current = _loads(await r.get(key))
+        document: dict[str, Any] = current if isinstance(current, dict) else {}
+
+        if target == "UpdateStatus":
+            # a bare ordinal, but the stored contract is a name -- the bridge
+            # writes "Online" and `presence_to_client` resolves by name
+            document["Status"] = (
+                _STATUS_NAMES.get(_to_ordinal(payload), "Online") if _to_ordinal(payload) else "Offline"
+            )
+        else:
+            document["Activity"] = _activity_document(payload)
+
+        if document.get("Status") == "Offline" or document.get("Activity") is None:
+            # Offline, or gone idle: the client reads a missing key as "not
+            # online" and removes the row.
             await r.delete(key)
         else:
-            body = payload if isinstance(payload, str) else json.dumps(payload)
-            await r.set(key, body, ex=PRESENCE_TTL_SECONDS)
+            document.setdefault("client", "lazer")
+            await r.set(key, json.dumps(document), ex=PRESENCE_TTL_SECONDS)
 
         # advance the change cursor the client resumes from after a reconnect
         await r.incr(QUEUE_KEY)
@@ -275,15 +321,90 @@ _UNION_KEYS = {
     "EditingBeatmap": 41,
     "ModdingBeatmap": 42,
     "TestingBeatmap": 43,
+    "InDailyChallengeLobby": 51,
+    "PlayingDailyChallenge": 52,
 }
 
-# `InGame` subclasses share one [Key] layout (UserActivity.cs:67-78):
-# 0 BeatmapID, 1 BeatmapDisplayTitle, 2 RulesetID, 3 RulesetPlayingVerb
-_IN_GAME_TYPES = {"InSoloGame", "InMultiplayerGame", "SpectatingMultiplayerGame", "InPlaylistGame"}
+# Member layouts per activity base, transcribed from
+# osu.Game/Users/UserActivity.cs. A `[MessagePackObject]` is sent as an array of
+# exactly `len(members)` values, so a wrong count is a hard parse failure in the
+# client's binder -- and it fails *silently*, leaving the online list empty.
+#
+# InGame (UserActivity.cs:59-78)     BeatmapID, BeatmapDisplayTitle, RulesetID,
+#                                    RulesetPlayingVerb
+# EditingBeatmap (:150-158)          BeatmapID, BeatmapDisplayTitle
+# WatchingReplay (:196-209)          ScoreID, PlayerName, BeatmapID, BeatmapDisplayTitle
+# InLobby (:260-267)                 RoomID, RoomName
+# ChoosingBeatmap, SearchingForLobby, InDailyChallengeLobby declare no members.
+_ACTIVITY_MEMBERS: dict[str, tuple[str, ...]] = {
+    "InSoloGame": ("BeatmapID", "BeatmapDisplayTitle", "RulesetID", "RulesetPlayingVerb"),
+    "InMultiplayerGame": ("BeatmapID", "BeatmapDisplayTitle", "RulesetID", "RulesetPlayingVerb"),
+    "SpectatingMultiplayerGame": ("BeatmapID", "BeatmapDisplayTitle", "RulesetID", "RulesetPlayingVerb"),
+    "InPlaylistGame": ("BeatmapID", "BeatmapDisplayTitle", "RulesetID", "RulesetPlayingVerb"),
+    "PlayingDailyChallenge": ("BeatmapID", "BeatmapDisplayTitle", "RulesetID", "RulesetPlayingVerb"),
+    "EditingBeatmap": ("BeatmapID", "BeatmapDisplayTitle"),
+    "ModdingBeatmap": ("BeatmapID", "BeatmapDisplayTitle"),
+    "TestingBeatmap": ("BeatmapID", "BeatmapDisplayTitle"),
+    "WatchingReplay": ("ScoreID", "PlayerName", "BeatmapID", "BeatmapDisplayTitle"),
+    "SpectatingUser": ("ScoreID", "PlayerName", "BeatmapID", "BeatmapDisplayTitle"),
+    "InLobby": ("RoomID", "RoomName"),
+}
 
 # `UserStatus` ordinals (osu.Game/Users/UserStatus.cs): Offline=0,
 # DoNotDisturb=1, Online=2. JSON stores the name; the wire wants the ordinal.
 _STATUS_ORDINALS = {"Offline": 0, "DoNotDisturb": 1, "Online": 2}
+_STATUS_NAMES = {ordinal: name for name, ordinal in _STATUS_ORDINALS.items()}
+
+
+def _to_ordinal(value: Any) -> int:
+    """Coerce a `UserStatus` argument to its ordinal.
+
+    The client sends a bare int over the hub, but a JSON-hub client would send
+    the name, so both spellings are accepted.
+    """
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        return _STATUS_ORDINALS.get(value, 0)
+
+    return 0
+
+
+def _activity_document(payload: Any) -> dict[str, Any] | None:
+    """Turn an inbound `UserActivity` union array into the stored named form.
+
+    Redis holds the same shape bakenohana's bridge writes -- ``{"type": ...}``
+    plus named members -- because `presence_to_client` and both writers agree on
+    that. The wire form is the opposite: a positional ``[unionKey, [members...]]``
+    array, e.g. ``[12, [5333124, "Sewerslvt - ...", 0, "Clicking circles"]]``.
+
+    ``None`` means the client sent nil, which is how it says "idle".
+    """
+    if payload is None:
+        return None
+
+    # a bare {"type": ...} is already in stored form
+    if isinstance(payload, dict):
+        return payload
+
+    if not isinstance(payload, (list, tuple)) or not payload:
+        return {"type": "ChoosingBeatmap"}
+
+    union_key = payload[0]
+    members = payload[1] if len(payload) > 1 and isinstance(payload[1], (list, tuple)) else []
+
+    for name, key in _UNION_KEYS.items():
+        if key != union_key:
+            continue
+
+        names = _ACTIVITY_MEMBERS.get(name, ())
+        document: dict[str, Any] = {"type": name}
+        document.update({member: members[i] for i, member in enumerate(names) if i < len(members)})
+        return document
+
+    return {"type": "ChoosingBeatmap"}
 
 
 def _activity_payload(kind: str, activity: dict[str, Any]) -> list[Any]:
@@ -294,14 +415,31 @@ def _activity_payload(kind: str, activity: dict[str, Any]) -> list[Any]:
         # user from the list entirely. Losing the row is worse than a wrong verb.
         return [_UNION_KEYS["ChoosingBeatmap"], {}]
 
-    if kind in _IN_GAME_TYPES:
-        return [
-            key,
-            {0: activity.get("BeatmapID"), 1: activity.get("BeatmapDisplayTitle"), 2: activity.get("RulesetID")},
-        ]
+    members = _ACTIVITY_MEMBERS.get(kind)
 
-    # Every other declared activity carries no [Key] members, so an empty map.
-    return [key, {}]
+    if members is None:
+        # Declares no members, so the payload is an **empty array**.
+        #
+        # `[]` explicitly, not `{}`: positionalise decides map-vs-array from the
+        # keys, and an empty dict has none, so it would have stayed a fixmap --
+        # the exact failure this whole change is fixing, reappearing for the one
+        # type that has no members to infer a shape from. The client reads these
+        # with `ReadArrayHeader()` like every other object.
+        return [key, []]
+
+    # `RulesetPlayingVerb` is what the client renders as the status text
+    # (`GetStatus()` returns it), so it is not decoration -- omitting it was one
+    # of the reasons an InGame presence failed to bind. Stable's bancho status
+    # has no such concept, so derive the standard verb from the ruleset.
+    values: dict[int, Any] = {}
+
+    for index, name in enumerate(members):
+        if name == "RulesetPlayingVerb":
+            values[index] = "playing"
+        else:
+            values[index] = activity.get(name)
+
+    return [key, values]
 
 
 def presence_to_client(stored: Any) -> dict[int, Any] | None:

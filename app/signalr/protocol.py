@@ -65,6 +65,41 @@ PROTOCOL_JSON = "json"
 PROTOCOL_MSGPACK = "messagepack"
 
 
+def positionalise(value: Any) -> Any:
+    """Recursively turn int-keyed maps into positional arrays.
+
+    A msgpack map whose keys are all integers is how a ``[MessagePackObject]``
+    with ``[Key(N)]`` members is *written down here*, but it is not how it is
+    *sent*: MessagePack-CSharp writes an array for int keys and reserves maps
+    for string keys. So the dict form is a readable authoring convention and
+    this is the single place it becomes wire shape.
+
+    Gaps are padded with ``None`` so array position still equals ``Key(N)``.
+    ``None`` is not a general substitute for a missing member -- the client
+    distinguishes an absent optional member from a nil one for reference types
+    -- but every DTO here declares its members unconditionally, so a gap means a
+    bug and padding keeps the shape readable rather than silently shifting every
+    later field, which is what truncation would do.
+    """
+    # `msgpack.ExtType` is a tuple subclass, so it must be checked before the
+    # sequence branch or it gets shredded into `[code, data]` -- destroying the
+    # one thing `raw=False` exists to preserve.
+    if isinstance(value, msgpack.ExtType):
+        return value
+
+    if isinstance(value, dict):
+        if value and all(isinstance(k, int) and not isinstance(k, bool) for k in value):
+            highest = max(value)
+            return [positionalise(value[i]) if i in value else None for i in range(highest + 1)]
+
+        return {k: positionalise(v) for k, v in value.items()}
+
+    if isinstance(value, (list, tuple)):
+        return [positionalise(v) for v in value]
+
+    return value
+
+
 def encode_varint(value: int) -> bytes:
     """LEB128, least-significant group first.
 
@@ -250,13 +285,46 @@ class MessagePackCodec(Codec):
     ``[Union]`` types (``UserActivity`` and friends) need no special handling:
     ``SignalRUnionWorkaroundResolver`` delegates to the standard resolver, and
     ``UnionFormatter`` encodes them as a plain array of ``[key, payload]``.
+
+    Int-keyed maps become **positional arrays** on the way out
+    ---------------------------------------------------
+    MessagePack-CSharp serialises a ``[MessagePackObject]`` whose members are
+    ``[Key(N)]`` integers as an array, and only as an array. Every DTO in these
+    hubs is declared that way, so the client's reader calls ``ReadArrayHeader``
+    and a fixmap is rejected outright -- silently, because it happens inside the
+    invocation binder, so the handler never runs and the UI just stays empty.
+
+    Proven against the real client with ``SIGNALR_WIRE_LOG=1``. Lazer sends::
+
+        UpdateActivity  [[12, [5333124, "Sewerslvt - Cyberia Lyr3 ...", 0, "Clicking circles"]]]
+        CreateRoom      [[0, 0, ["kaupec2's awesome room", 0, "", 1, 0, 0, false, nil], [], nil, nil, [...], [], 0]]
+
+    -- arrays throughout, where we were emitting int-keyed maps such as
+    ``{0: [11, {}], 1: 2}`` for ``UserPresence``.
+
+    Rather than hand-rewrite every payload (30 sites, and it has already been
+    got wrong once), the conversion happens here: a dict whose keys are *all*
+    integers is a ``[MessagePackObject]`` and becomes a positional array. String
+    keys stay a map, which is what the envelope's ``headers`` is.
     """
 
     name = PROTOCOL_MSGPACK
     binary = True
 
+    @staticmethod
+    def _pack(value: Any) -> bytes:
+        """msgpack-encode, rewriting int-keyed maps as positional arrays.
+
+        Every pack path goes through here, including ``encode_message``. That
+        matters: the envelope is assembled as a list and used to be packed
+        directly, so payloads nested inside `arguments` never reached
+        `positionalise` and went out as fixmaps (`82`) while the envelope around
+        them looked perfectly correct.
+        """
+        return msgpack.packb(positionalise(value), use_bin_type=True)
+
     def encode(self, payload: dict[str, Any]) -> bytes:
-        return msgpack.packb(payload, use_bin_type=True)
+        return self._pack(payload)
 
     def decode(self, raw: bytes) -> dict[str, Any]:
         value = msgpack.unpackb(raw, raw=False, strict_map_key=False)
@@ -303,7 +371,7 @@ class MessagePackCodec(Codec):
 
         if kind == MSG_PING:
             # PingMessage is the one-element array, nothing else.
-            return msgpack.packb([kind], use_bin_type=True)
+            return self._pack([kind])
 
         if kind == MSG_COMPLETION:
             return self._encode_completion(message)
@@ -312,7 +380,7 @@ class MessagePackCodec(Codec):
         if layout is None:
             raise ValueError(f"no MessagePack array layout for message type {kind}")
 
-        return msgpack.packb([self._element(field, message) for field in layout], use_bin_type=True)
+        return self._pack([self._element(field, message) for field in layout])
 
     def _encode_completion(self, message: dict[str, Any]) -> bytes:
         """Completion is variable-length: its tail depends on the result kind."""
@@ -321,34 +389,31 @@ class MessagePackCodec(Codec):
 
         if error:
             # ErrorResult: the array carries the message, never a result.
-            return msgpack.packb(
+            return self._pack(
                 [
                     MSG_COMPLETION,
                     message.get(FIELD_HEADERS) or {},
                     message.get(FIELD_INVOCATION_ID),
                     RESULT_ERROR,
                     error,
-                ],
-                use_bin_type=True,
+                ]
             )
 
         if has_result:
-            return msgpack.packb(
+            return self._pack(
                 [
                     MSG_COMPLETION,
                     message.get(FIELD_HEADERS) or {},
                     message.get(FIELD_INVOCATION_ID),
                     RESULT_NON_VOID,
                     message.get(FIELD_RESULT),
-                ],
-                use_bin_type=True,
+                ]
             )
 
         # VoidResult: the array stops after the kind. An extra nil here would be
         # read as an argument and misparse.
-        return msgpack.packb(
-            [MSG_COMPLETION, message.get(FIELD_HEADERS) or {}, message.get(FIELD_INVOCATION_ID), RESULT_VOID],
-            use_bin_type=True,
+        return self._pack(
+            [MSG_COMPLETION, message.get(FIELD_HEADERS) or {}, message.get(FIELD_INVOCATION_ID), RESULT_VOID]
         )
 
     def _element(self, field: str, message: dict[str, Any]) -> Any:

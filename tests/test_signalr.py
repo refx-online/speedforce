@@ -35,7 +35,8 @@ from app.signalr.metadata import presence_to_client  # noqa: E402
 from app.signalr.protocol import FrameReader  # noqa: E402
 from app.signalr.protocol import encode_varint  # noqa: E402
 from app.signalr.protocol import JSONCodec  # noqa: E402
-from app.signalr.protocol import MessagePackCodec  # noqa: E402
+from app.signalr.protocol import MessagePackCodec
+from app.signalr.protocol import positionalise  # noqa: E402
 
 RS = "\x1e"
 passed = 0
@@ -235,22 +236,66 @@ async def main() -> int:
                 "redis presence entry written", bool(raw), f"key={PRESENCE_KEY.format(user_id=user_id)} value={raw!r}"
             )
 
-            print("\nUpdateStatus relays verbatim")
-            activity = {"type": "InSoloGame", "BeatmapID": 5649109, "RulesetID": 0}
+            # `IMetadataServer` has two separate methods and lazer calls both
+            # right after connecting, each carrying only its own half. Confirmed
+            # from the wire with both clients attached:
+            #   UpdateActivity [[12, [5333124, "Sewerslvt - ...", 0, "Clicking circles"]]]
+            #   UpdateStatus   [2]
+            # Conflating them left the key holding a bare `2`, which
+            # `presence_to_client` rejects as not-a-dict, so the user resolved to
+            # offline and vanished from every list.
+            print("\nUpdateActivity and UpdateStatus merge into one document")
             ws.send_text(
-                json.dumps({"type": 1, "invocationId": "3", "target": "UpdateStatus", "arguments": [activity]}) + RS
+                json.dumps(
+                    {
+                        "type": 1,
+                        "invocationId": "3",
+                        "target": "UpdateActivity",
+                        "arguments": [[12, [5649109, "weird\u001ename", 0, "Clicking circles"]]],
+                    }
+                )
+                + RS
             )
             frames(ws.receive_text())
             stored = redis("GET", PRESENCE_KEY.format(user_id=user_id))
-            check("status stored", "InSoloGame" in (stored or ""), stored)
+            check("activity type stored", "InSoloGame" in (stored or ""), stored)
             check("beatmap id preserved verbatim", "5649109" in (stored or ""), stored)
+            # payload containing the record separator survives framing
+            check(
+                "payload containing the record separator survives framing", r"weird\u001ename" in (stored or ""), stored
+            )
+            check("the status half survives the activity update", '"Online"' in (stored or ""), stored)
 
-            print("\nidle (null status)")
+            # a bare status ordinal must not wipe the activity
+            ws.send_text(json.dumps({"type": 1, "invocationId": "4", "target": "UpdateStatus", "arguments": [2]}) + RS)
+            frames(ws.receive_text())
+            stored = redis("GET", PRESENCE_KEY.format(user_id=user_id))
+            check("a bare status ordinal does not discard the activity", "InSoloGame" in (stored or ""), stored)
+            check("status ordinal 2 stored as a name", '"Online"' in (stored or ""), stored)
+
+            print("\nidle (null activity)")
             ws.send_text(
-                json.dumps({"type": 1, "invocationId": "4", "target": "UpdateStatus", "arguments": [None]}) + RS
+                json.dumps({"type": 1, "invocationId": "5", "target": "UpdateActivity", "arguments": [None]}) + RS
             )
             frames(ws.receive_text())
-            check("null clears presence", redis("GET", PRESENCE_KEY.format(user_id=user_id)) == "", "still present")
+            check(
+                "null activity clears presence",
+                redis("GET", PRESENCE_KEY.format(user_id=user_id)) == "",
+                "still present",
+            )
+
+            print("\noffline status clears presence")
+            ws.send_text(
+                json.dumps({"type": 1, "invocationId": "5b", "target": "UpdateActivity", "arguments": [[11, []]]}) + RS
+            )
+            frames(ws.receive_text())
+            ws.send_text(json.dumps({"type": 1, "invocationId": "5c", "target": "UpdateStatus", "arguments": [0]}) + RS)
+            frames(ws.receive_text())
+            check(
+                "status Offline clears presence",
+                redis("GET", PRESENCE_KEY.format(user_id=user_id)) == "",
+                "still present",
+            )
 
             print("\nqueue cursor advances")
             before = int(redis("GET", "signalr:presence_queue_id") or 0)
@@ -258,9 +303,9 @@ async def main() -> int:
                 json.dumps(
                     {
                         "type": 1,
-                        "invocationId": "5",
+                        "invocationId": "5z",
                         "target": "UpdateActivity",
-                        "arguments": [{"type": "ChoosingBeatmap"}],
+                        "arguments": [[11, []]],
                     }
                 )
                 + RS
@@ -298,13 +343,17 @@ async def main() -> int:
             check("returns a BeatmapUpdates-shaped cursor", ok, str(got))
 
             mpc0 = MessagePackCodec()
-            mp_cursor = mpc0.decode_message(
-                mpc0.encode_message({"type": 3, "invocationId": "6", "result": {0: [], 1: 7}})
+            # `BeatmapUpdates` is positional on the wire too -- the same rule as
+            # every other `[MessagePackObject]`. Asserted over the encoded bytes,
+            # because decoding alone cannot distinguish the two spellings.
+            mp_cursor = msgpack.unpackb(
+                mpc0.encode_message({"type": 3, "invocationId": "6", "result": {0: [], 1: 7}}),
+                strict_map_key=False,
             )
             check(
-                "BeatmapUpdates keys stay ints over messagepack",
-                mp_cursor.get("result") == {0: [], 1: 7},
-                str(mp_cursor.get("result")),
+                "BeatmapUpdates is a positional array over messagepack",
+                mp_cursor[4] == [[], 7],
+                str(mp_cursor[4]),
             )
 
         # The shape that actually matters: the JSON path stringifies the int keys
@@ -343,36 +392,64 @@ async def main() -> int:
             # The beatmap name carries 0x1e, which is both the record separator
             # and a valid msgpack int, so this also pins the framing: a pump that
             # split on the separator byte would tear this message in half.
-            activity = {
-                "type": "InSoloGame",
-                "BeatmapID": 5649109,
-                "RulesetID": 0,
-                "Details": {"Text": "weird\x1ename"},
-            }
-            ws.send_bytes(mp_frame({"type": 1, "invocationId": "2", "target": "UpdateStatus", "arguments": [activity]}))
+            # the real union array, as lazer sends it: [12, [id, title, ruleset, verb]]
+            activity = [12, [5649109, "weird\x1ename", 0, "Clicking circles"]]
+            ws.send_bytes(
+                mp_frame({"type": 1, "invocationId": "2", "target": "UpdateActivity", "arguments": [activity]})
+            )
             mp_frames(ws.receive_bytes())
             stored = redis("GET", PRESENCE_KEY.format(user_id=user_id)) or ""
-            check("msgpack status stored", "InSoloGame" in stored, stored)
+            check("msgpack union array decoded to the activity type", "InSoloGame" in stored, stored)
             check("msgpack beatmap id preserved verbatim", "5649109" in stored, stored)
+            check("the fourth InGame member survives", "Clicking circles" in stored, stored)
             # presence is re-serialised to JSON for redis, which escapes the byte
             check("payload containing the record separator survives framing", r"weird\u001ename" in stored, stored)
 
         print("\npresence wire shape")
         # UserPresence is [Key(0)] Activity / [Key(1)] Status, and Activity is a
-        # [Union] array -- so integer keys, NOT the JSON shape stored in redis.
-        # Asserted here because a wrong shape decodes to nothing client-side and
-        # the players list is simply empty with no error.
+        # [Union] array. A [MessagePackObject] with integer keys goes on the wire
+        # as a **positional array**, not as an int-keyed map -- verified against
+        # the real client, which sends
+        #   UpdateActivity [[12, [5333124, "title", 0, "Clicking circles"]]]
+        # with all four InGame members. The dict form here is the authoring
+        # convention; `positionalise` is what turns it into wire shape, so this
+        # asserts on the *encoded* bytes rather than on our own intermediate.
+        mpc0 = MessagePackCodec()
         p = presence_to_client({"Activity": {"type": "InSoloGame", "BeatmapID": 5649109}, "Status": "Online"})
         check("presence uses integer keys 0/1", sorted(p.keys()) == [0, 1], str(p))
         check("status is the enum ordinal", p[1] == 2, str(p))
+
+        on_wire = msgpack.unpackb(mpc0.encode(p), strict_map_key=False)
         check(
-            "activity is a [key, payload] union array",
-            p[0] == [12, {0: 5649109, 1: None, 2: None}],
-            str(p[0]),
+            "UserPresence is a positional array [Activity, Status]",
+            isinstance(on_wire, list) and len(on_wire) == 2 and on_wire[1] == 2,
+            str(on_wire),
         )
+        activity = on_wire[0]
+        check(
+            "activity is the union array [12, members]",
+            isinstance(activity, list) and activity[0] == 12,
+            str(activity),
+        )
+        check(
+            "InGame carries all four members including RulesetPlayingVerb",
+            isinstance(activity[1], list) and len(activity[1]) == 4 and activity[1][0] == 5649109,
+            str(activity[1]),
+        )
+        check(
+            "ChoosingBeatmap union payload is an empty array",
+            msgpack.unpackb(
+                mpc0.encode(presence_to_client({"Activity": {"type": "ChoosingBeatmap"}, "Status": "Online"})),
+                strict_map_key=False,
+            )[0][1]
+            == [],
+        )
+        # the whole point: no fixmap anywhere inside a presence payload
+        first = mpc0.encode(p)[0]
+        check("presence payload does not start with a fixmap", not (0x80 <= first <= 0x8F), f"0x{first:02x}")
         idle = presence_to_client({"Activity": {"type": "ChoosingBeatmap"}, "Status": "Online"})
         check("ChoosingBeatmap union key is 11", idle[0][0] == 11, str(idle[0]))
-        check("ChoosingBeatmap has no keyed members", idle[0][1] == {}, str(idle[0]))
+        check("ChoosingBeatmap has no keyed members (an empty array)", idle[0][1] == [], str(idle[0]))
         check("offline presence is None", presence_to_client({"Status": "Offline", "Activity": None}) is None)
         check(
             "unknown activity falls back rather than dropping the user",
@@ -466,21 +543,25 @@ async def main() -> int:
             # fills in the ones the layout requires (headers, streams,
             # invocationId), which is the point of the layout, not a loss.
             back = mpc.decode_message(mpc.encode_message(outgoing))
-            supplied = {k: v for k, v in back.items() if k in outgoing}
+            # Compare on the *wire* spelling: decoding fills in the envelope
+            # defaults (headers, streams, invocationId) and int-keyed payload
+            # maps come back as the positional arrays they were encoded as.
+            supplied = positionalise({k: v for k, v in back.items() if k in outgoing})
             check(
                 f"round trip {outgoing['type']}: {outgoing.get('target') or outgoing.get('invocationId') or 'ping'}",
-                supplied == outgoing,
+                supplied == positionalise(outgoing),
                 f"{supplied} != {outgoing}",
             )
 
-        # The union payloads nest *inside* arguments and stay maps with integer
-        # keys -- unaffected by the envelope change.
-        union = {"type": 1, "target": "UserPresenceUpdated", "arguments": [{0: [11, {}], 1: 2}]}
+        # A `UserPresence` nests *inside* the invocation's arguments and is
+        # itself a positional array -- verified against the real client, which
+        # reads presence pushes as `[Activity, Status]`.
+        union = {"type": 1, "target": "UserPresenceUpdated", "arguments": [{0: [11, []], 1: 2}]}
+        on_wire_union = msgpack.unpackb(mpc.encode_message(union), strict_map_key=False)
         check(
-            "union payload survives the array envelope as an int-keyed map",
-            # strict_map_key=False: lazer's DTOs are int-keyed maps, and the real
-            # parser reads them with that relaxed setting too.
-            msgpack.unpackb(mpc.encode_message(union), strict_map_key=False)[4] == [{0: [11, {}], 1: 2}],
+            "the union sits inside a positional UserPresence array",
+            on_wire_union[4] == [[[11, []], 2]],
+            str(on_wire_union[4]),
         )
 
         # JSON keeps its object envelope; only MessagePack is positional.
@@ -517,7 +598,32 @@ async def main() -> int:
                 msgpack.ExtType(42, b"\x00\xff"),  # ext must keep its code
             ],
         }
-        check("union and exotic shapes survive a round trip", codec.decode(codec.encode(tricky)) == tricky, str(tricky))
+        # Int-keyed maps are now *deliberately* rewritten as positional arrays on
+        # encode, so "survives unchanged" means the *values* survive -- the shape
+        # is the client's contract, not ours to preserve.
+        round_tripped = codec.decode(codec.encode(tricky))
+        check(
+            "union shape survives a round trip",
+            round_tripped["arguments"][0] == [1, {"Key": 1, "Value": 2}],
+            str(round_tripped["arguments"][0]),
+        )
+        check(
+            "ext type keeps its code across a round trip",
+            round_tripped["arguments"][2] == msgpack.ExtType(42, b"\x00\xff"),
+            str(round_tripped["arguments"][2]),
+        )
+        # A *mixed*-key map has no `[Key(N)]` ordinals, so it is not a
+        # MessagePackObject and must stay a map rather than be positionalised.
+        check(
+            "a mixed-key map stays a map, not a positional array",
+            round_tripped["arguments"][1] == {"0": "int-keyed map", 1: "int-keyed map"},
+            str(round_tripped["arguments"][1]),
+        )
+        check(
+            "a fully int-keyed map does become a positional array",
+            msgpack.unpackb(codec.encode({"arguments": [{0: "a", 1: "b"}]}), strict_map_key=False)["arguments"][0]
+            == ["a", "b"],
+        )
         check(
             "integer map keys do not raise on decode",
             codec.decode(msgpack.packb({1: "a"}, use_bin_type=True)) == {1: "a"},

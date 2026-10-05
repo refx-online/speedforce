@@ -186,17 +186,35 @@ async def main() -> int:
         # named form, so a live room came back titled
         # "{0: 'my room', 1: 0, ...}" -- the name stringified, because the room map
         # itself was being read as the settings map.
+        #
+        # Settings is Key(2) of MultiplayerRoom, and the whole room arrives as a
+        # positional array. Both shapes below are taken from what the real client
+        # actually sends (SIGNALR_WIRE_LOG):
+        #   [0, 0, ["kaupec2's awesome room", 0, "", 1, 0, 0, false, nil], [], ...]
         from app.signalr.multiplayer import _parse_settings
 
-        int_keyed = _parse_settings({0: {0: "int keyed", 1: 5649109, 7: 4}, 1: None})
-        check("integer-keyed room settings yield the name", int_keyed.name == "int keyed", repr(int_keyed.name))
-        check("integer-keyed room settings yield MaxPlayers", int_keyed.max_players == 4, repr(int_keyed.max_players))
+        positional_room = [0, 0, ["positional room", 0, "", 1, 0, 0, False, 4], [], None, None, [[]], [], 0]
+        as_array = _parse_settings(positional_room)
+        check("a positional room array yields the name", as_array.name == "positional room", repr(as_array.name))
+        check("MaxParticipants is read from index 7", as_array.max_players == 4, repr(as_array.max_players))
         check(
-            "integer-keyed room settings yield the beatmap", int_keyed.beatmap_id == 5649109, repr(int_keyed.beatmap_id)
+            "a password at index 2 is honoured",
+            _parse_settings([0, 0, ["n", 0, "hunter2", 1, 0, 0, False, 8]]).password == "hunter2",
         )
 
-        bare = _parse_settings({0: "bare settings", 1: 5649109, 7: 4})
-        check("a bare settings map is not mistaken for a room", bare.name == "bare settings", repr(bare.name))
+        # The int-keyed dict form is the authoring convention and must still parse.
+        int_keyed = _parse_settings({0: 0, 1: 0, 2: {0: "int keyed", 1: 0, 2: "", 3: 1, 4: 0, 5: 0, 6: False, 7: 4}})
+        check("integer-keyed room settings yield the name", int_keyed.name == "int keyed", repr(int_keyed.name))
+        check("integer-keyed room settings yield MaxPlayers", int_keyed.max_players == 4, repr(int_keyed.max_players))
+
+        # Settings has no beatmap or ruleset member at all -- they live on the
+        # playlist item. Reading index 1 as a beatmap id picked up PlaylistItemId,
+        # and index 4 as a ruleset id picked up the QueueMode enum.
+        check("PlaylistItemId is not mistaken for a beatmap id", as_array.beatmap_id == 0, repr(as_array.beatmap_id))
+        check("QueueMode is not mistaken for a ruleset id", as_array.ruleset_id == 0, repr(as_array.ruleset_id))
+
+        bare = _parse_settings([0, 0, ["bare settings", 0, "", 1, 0, 0, False, 16]])
+        check("a settings array is not mistaken for a room", bare.name == "bare settings", repr(bare.name))
         check("room state is an enum int, not a name", R[1] in (0, 1, 2, 3), repr(R.get(1)))
         check("playlist seeded with the beatmap", len(R[6]) == 1, str(R.get(6)))
         check("creator is host", bool(R[4]) and R[4][0] > 0, str(R.get(4)))
@@ -209,7 +227,10 @@ async def main() -> int:
         )
         # beatmap id/checksum are flat members (keys 2,3), not a nested Beatmap
         check("playlist item beatmap id is flat at key 2", R[6][0][2] == 5649109, str(R[6][0]))
-        check("playlist item checksum is flat at key 3", R[6][0][3] == "1c72", str(R[6][0]))
+        check("playlist item checksum is flat at key 3", R[6][0].get(3) == "", str(R[6][0]))
+        # StarRating at Key(10) comes from the beatmap row; a missing map must not
+        # take the whole payload down.
+        check("playlist item StarRating is a float at key 10", isinstance(R[6][0].get(10), float), str(R[6][0]))
 
         # Key *types* come from the room object, since JSON stringifies them.
         raw_room = room_registry[room_id].to_client()
