@@ -25,8 +25,13 @@ from app.models.beatmap_repo import search_beatmapsets
 from app.models.repository import UserRow
 from app.models.score_repo import get_map
 from app.route.me import require_user
+from app.signalr.multiplayer import rooms as multiplayer_rooms
 
 router = APIRouter(prefix="/api/v2", tags=["osu! API v2"])
+
+# The `ids[]` batch endpoints cap at 50 per request; matching the client's own
+# limit so an unbounded IN(...) cannot be used to pull the whole table.
+MAX_BATCH_IDS = 50
 
 
 @router.get("/beatmapsets/search")
@@ -99,6 +104,9 @@ async def get_set(beatmapset_id: int) -> JSONResponse:
     return JSONResponse(content=beatmap_set.model_dump())
 
 
+# NOTE: /beatmaps/ must stay declared BEFORE /beatmaps/{beatmap_id} -- FastAPI
+# matches in declaration order, and an empty segment cannot be captured by
+# {beatmap_id} anyway, but keeping the specific routes together avoids surprises.
 @router.get("/beatmaps/lookup")
 async def lookup_beatmap(id: int = Query(0), checksum: str | None = None) -> JSONResponse:
     if not id:
@@ -109,6 +117,32 @@ async def lookup_beatmap(id: int = Query(0), checksum: str | None = None) -> JSO
     if checksum and rows[0].md5.lower() != checksum.lower():
         return JSONResponse(status_code=404, content={"error": "beatmap checksum mismatch"})
     return JSONResponse(content=row_to_beatmap(rows[0]).model_dump())
+
+
+@router.get("/beatmaps/")
+async def batch_get_beatmaps(ids: list[int] = Query(default_factory=list, alias="ids[]")) -> JSONResponse:
+    """Batch beatmaps.
+
+    `GetBeatmapsRequest` targets ``beatmaps/?ids[]=`` -- with a literal trailing
+    slash, which `/beatmaps/{beatmap_id}` cannot match because the segment is
+    empty. So this is a *different* route, not a variant of the one above, and
+    omitting it 404s a call the login/beatmap path makes.
+
+    Two contract details that are easy to get wrong:
+
+    * the response is an **object** ``{"beatmaps": [...], "cursor": ...}``
+      (`GetBeatmapsResponse : ResponseWithCursor`), not a bare array. That is the
+      opposite of `/chat/channels`, which genuinely is a bare array.
+    * up to 50 ids per request; the client never sends more, and an unbounded
+      `IN (...)` is a cheap way to be abused.
+    """
+    batch = ids[:MAX_BATCH_IDS]
+    rows = await get_beatmap_rows_by_ids(batch) if batch else []
+
+    by_id = {row.id: row_to_beatmap(row) for row in rows}
+    # Preserve the requested order and silently skip ids we have no row for,
+    # rather than 404ing the whole batch: the caller asked for a set.
+    return JSONResponse(content={"beatmaps": [by_id[i].model_dump() for i in batch if i in by_id], "cursor": None})
 
 
 @router.get("/beatmaps/{beatmap_id}")
@@ -251,3 +285,11 @@ async def beatmap_scores(
     ]
 
     return JSONResponse(content={"scores": payload, "total_score_count": len(payload)})
+
+
+# lazer's lounge room list is a REST call, not a hub call
+# (osu.Game/Online/Rooms/GetRoomsRequest.cs, Target => "rooms"). Kept here rather
+# than in the hub because it is polled on entry to the lounge.
+@router.get("/rooms")
+async def list_rooms() -> JSONResponse:
+    return JSONResponse(content=[room.summary() for room in multiplayer_rooms.values()])

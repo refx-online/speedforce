@@ -9,10 +9,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import json
 from typing import Any
 from typing import Protocol
 
+import msgpack
 from fastapi import APIRouter
 from fastapi import Query
 from fastapi import Request
@@ -72,19 +72,22 @@ def mount(hub: HubHandler) -> None:
         request: Request,
         negotiateVersion: int | None = Query(None),  # noqa: N803 - wire name
     ) -> JSONResponse:
-        # SignalR authenticates hubs by `access_token` on the query string,
-        # because a browser websocket cannot carry an Authorization header.
+        # The client authenticates with `Authorization: Bearer` on this POST and
+        # then reads the token back out of `accessToken` to put on the websocket
+        # URL -- a websocket cannot carry an Authorization header. Echoing it is
+        # therefore mandatory, not a convenience.
+        access_token = _bearer_token(request)
         token = protocol.ConnectionToken(
             connection_id=registry.tokens.issue(hub.name).connection_id,
             hub=hub.name,
             expires_at=0.0,
         )
-        return JSONResponse(protocol.negotiate_payload(token, negotiateVersion))
+        return JSONResponse(protocol.negotiate_payload(token, negotiateVersion, access_token))
 
     @router.websocket(f"/signalr/{hub.name}")
     async def connect(websocket: WebSocket) -> None:
         connection_id = websocket.query_params.get("id", "")
-        access_token = websocket.query_params.get("access_token", "")
+        access_token = _bearer_token(websocket)
 
         try:
             token = registry.tokens.consume(connection_id, hub.name)
@@ -112,82 +115,196 @@ def mount(hub: HubHandler) -> None:
 
         # Server-authoritative: if the handshake is missing or names a protocol
         # we do not speak, refuse before any method can be invoked.
-        handshake_ok = await _perform_handshake(websocket)
-        if not handshake_ok:
+        codec = await _perform_handshake(websocket)
+        if codec is None:
             with contextlib.suppress(Exception):
                 await websocket.close(code=4402)
             return
 
+        # Only now is the wire protocol known, so this is the earliest point the
+        # connection can be told how to encode.
+        connection.codec = codec
+
         await hub.on_connect(connection)
+
+        keepalive = asyncio.create_task(_keepalive(connection))
 
         try:
             await _pump(websocket, hub, connection)
         finally:
+            keepalive.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await keepalive
             connection.close()
             with contextlib.suppress(Exception):
                 await hub.on_disconnect(connection)
 
 
-async def _perform_handshake(websocket: WebSocket) -> bool:
-    """Read the handshake request and answer it.
+async def _receive_any(websocket: WebSocket, timeout: float) -> tuple[bytes, bool] | None:
+    """Receive one websocket message as raw bytes, plus whether it arrived binary.
 
-    The client sends ``{"protocol":"json","version":1}`` with the record
-    separator. Anything other than our protocol is refused so a MessagePack
-    client fails fast and visibly rather than misparsing frames.
+    Returns None for a non-data message (close, etc).
+
+    Two things are deliberately preserved rather than normalised away:
+
+    * **Bytes, not text.** A MessagePack payload is binary, and decoding it as
+      UTF-8 would corrupt it before the codec ever sees it. A text frame is
+      UTF-8 by definition, so encoding one back to bytes is lossless.
+    * **The frame type.** It is a reliable discriminator for the hub protocol,
+      because the protocol determines the transfer format -- JSON goes out as
+      text, MessagePack as binary. Guessing by trying each codec in turn is not
+      safe: ``{`` is both an ASCII brace and a msgpack fixmap header, so a JSON
+      text frame can decode as plausible-looking msgpack garbage.
+    """
+    message = await asyncio.wait_for(websocket.receive(), timeout=timeout)
+
+    if message["type"] == "websocket.disconnect":
+        raise WebSocketDisconnect(message.get("code", 1000))
+
+    if (text := message.get("text")) is not None:
+        return text.encode(), False
+
+    if (raw := message.get("bytes")) is not None:
+        return raw, True
+
+    return None
+
+
+async def _perform_handshake(websocket: WebSocket) -> protocol.Codec | None:
+    """Read the handshake request, answer it, and return the agreed codec.
+
+    **The handshake is always JSON**, whatever hub protocol was requested. This
+    is not a detail of this client but of the protocol: the spec states the
+    handshake request and response are "always a JSON message", because the
+    protocol name is what they *carry* and nothing has been negotiated yet. The
+    ASP.NET client agrees -- ``HandshakeProtocol.TryParseResponseMessage`` runs a
+    ``Utf8JsonReader`` over the response whatever ``HandshakeProtocols`` holds.
+
+    So the request goes out as JSON text, the reply comes back as JSON, and only
+    *afterwards* does the negotiated codec take over. Answering a MessagePack
+    handshake in MessagePack makes the client fail on its own handshake
+    (``'0x81' is an invalid start of a value`` -- ``0x81`` is a msgpack fixmap),
+    which it reports as a handshake failure and closes with ``4402``.
+
+    The request may still arrive in a *binary* frame, since the transport
+    format is settled before the handshake is written, hence reading raw bytes.
     """
     try:
-        raw = await asyncio.wait_for(websocket.receive_text(), timeout=protocol.IDLE_TIMEOUT)
+        received = await _receive_any(websocket, protocol.IDLE_TIMEOUT)
     except (asyncio.TimeoutError, WebSocketDisconnect, RuntimeError):
-        return False
+        return None
 
-    frame = raw.rstrip("\x1e")
+    if received is None:
+        return None
+
+    json_codec = protocol.JSONCodec()
+    frame = received[0].rstrip(protocol.RECORD_SEPARATOR)
+
     if not frame:
-        await websocket.send_text(protocol.handshake_response("expected handshake"))
-        return False
+        await protocol.send_handshake(websocket, "expected handshake")
+        return None
 
     try:
-        request = protocol.parse(frame)
-    except json.JSONDecodeError:
-        await websocket.send_text(protocol.handshake_response("invalid handshake payload"))
-        return False
+        # JSON regardless of the frame it arrived in: a binary frame carrying
+        # JSON text is still JSON, and guessing from the frame type is what
+        # produced the bug this comment exists to prevent.
+        request = protocol.parse(json_codec, frame)
+    except Exception:  # noqa: BLE001 - any codec failure means "unreadable handshake"
+        await protocol.send_handshake(websocket, "invalid handshake payload")
+        return None
 
-    if request.get("protocol") != protocol.PROTOCOL:
-        await websocket.send_text(protocol.handshake_response(f"unsupported protocol {request.get('protocol')!r}"))
-        return False
+    requested = request.get("protocol")
+    agreed = protocol.CODECS.get(str(requested)) if requested is not None else None
 
-    await websocket.send_text(protocol.handshake_response())
-    return True
+    if agreed is None:
+        await protocol.send_handshake(websocket, f"unsupported protocol {requested!r}")
+        return None
+
+    await protocol.send_handshake(websocket)
+    return agreed
+
+
+async def _keepalive(connection: HubConnection) -> None:
+    """Ping the client periodically so its ``ServerTimeout`` never fires.
+
+    A SignalR server is expected to *initiate*; without this the connection is
+    silent whenever the client has nothing to say, and the ASP.NET client's
+    ``ServerTimeout`` (30s default) drops it:
+
+        System.TimeoutException: Server timeout (30000,00ms) elapsed
+                                  without receiving a message from the server.
+
+    ``HubClientConnector`` sets no ``ServerTimeout`` and no ``KeepAliveInterval``,
+    so both are stock defaults -- 15s keepalive against a 30s timeout, which is
+    the pairing ASP.NET Core ships and the reason the interval here is 15s rather
+    than something more aggressive.
+
+    Doing this server-side also makes the question of whether *the client* pings
+    moot: its watchdog is satisfied by construction either way. The Ping is a
+    protocol requirement, not an optimisation.
+
+    ``ping()`` goes through the connection's send lock, so it cannot interleave
+    with a half-written frame.
+    """
+    while not connection._closed:
+        await asyncio.sleep(protocol.KEEPALIVE_INTERVAL_SECONDS)
+        await connection.ping()
 
 
 async def _pump(websocket: WebSocket, hub: HubHandler, connection: HubConnection) -> None:
     """Read framed messages until the socket closes.
 
-    Buffering matters: a websocket text frame does not have to align with a
-    SignalR message, so incomplete tails are carried over to the next read.
+    Buffering matters: a websocket frame does not have to align with a SignalR
+    message, so an incomplete tail is carried over to the next read. Which
+    protocol decides how that is done:
+
+    * **JSON** -- accumulate bytes and split on the record separator. Safe,
+      because a JSON payload is UTF-8 text and cannot contain a raw ``0x1e``.
+    * **MessagePack** -- hand the bytes to a streaming ``Unpacker``, which
+      tracks msgpack structure and so knows where a message ends. Splitting on
+      the separator instead would be wrong in a way that is easy to miss:
+      ``0x1e`` is a valid msgpack positive fixint (30), and a *string value*
+      containing that byte would be split in half. The ``Unpacker`` also holds
+      its own incomplete tail, so nothing is lost between reads.
     """
-    buffer = ""
+    codec = connection.codec
+    unpacker = msgpack.Unpacker(raw=False, strict_map_key=False) if codec.binary else None
+    buffer = b""
 
     while True:
         try:
-            raw = await asyncio.wait_for(websocket.receive_text(), timeout=protocol.IDLE_TIMEOUT)
+            received = await _receive_any(websocket, protocol.IDLE_TIMEOUT)
         except (asyncio.TimeoutError, WebSocketDisconnect, RuntimeError):
             return
 
-        buffer += raw
+        if received is None:
+            continue
 
-        while "\x1e" in buffer:
-            frame, _, buffer = buffer.partition("\x1e")
+        if unpacker is not None:
+            unpacker.feed(received[0])
+            for message in unpacker:
+                # Between messages the stream carries the 0x1e record separator,
+                # which the Unpacker faithfully decodes as a bare positive
+                # fixint. A real hub message is always a map, so a non-map at
+                # the top level is framing, not payload.
+                if isinstance(message, dict):
+                    await _dispatch(hub, connection, message)
+            continue
+
+        buffer += received[0]
+
+        while protocol.RECORD_SEPARATOR in buffer:
+            frame, _, buffer = buffer.partition(protocol.RECORD_SEPARATOR)
             if not frame:
                 continue
-            await _dispatch(hub, connection, frame)
+            try:
+                message = codec.decode(frame)
+            except Exception:  # noqa: BLE001 - a malformed frame is dropped, not fatal
+                continue
+            await _dispatch(hub, connection, message)
 
 
-async def _dispatch(hub: HubHandler, connection: HubConnection, frame: str) -> None:
-    try:
-        message = protocol.parse(frame)
-    except json.JSONDecodeError:
-        return
-
+async def _dispatch(hub: HubHandler, connection: HubConnection, message: dict[str, Any]) -> None:
     msg_type = message.get("type")
 
     # keepalive: answered with a Ping, which is what the spec calls for
@@ -204,7 +321,10 @@ async def _dispatch(hub: HubHandler, connection: HubConnection, frame: str) -> N
             result = await hub.invoke(connection, target, list(args))
         except Exception as exc:  # noqa: BLE001 - surfaced to the client as a completion error
             if invocation_id:
-                await connection.complete(str(invocation_id), None, str(exc))
+                # include the type: a client has to be able to tell
+                # NotImplementedError from a validation failure, and str(exc)
+                # alone throws that away
+                await connection.complete(str(invocation_id), None, f"{type(exc).__name__}: {exc}")
             return
 
         if invocation_id:
@@ -217,8 +337,30 @@ async def _dispatch(hub: HubHandler, connection: HubConnection, frame: str) -> N
         return
 
 
+def _bearer_token(request: Request | WebSocket) -> str:
+    """Pull the access token off a negotiate request or hub connection.
+
+    lazer authenticates hubs the way the ASP.NET SignalR client does:
+    ``HubClientConnector`` sets ``options.AccessTokenProvider``, which sends
+    ``Authorization: Bearer <jwt>`` on the negotiate POST; the response echoes it
+    back as ``accessToken`` and the client appends that to the websocket URL as
+    ``?access_token=``. So the header appears on negotiate and the query
+    parameter on the socket -- read both, on both, since either may carry it.
+
+    Deliberately not read from ``Sec-WebSocket-Protocol``: that is the other
+    transport some clients use, but uvicorn rejects a subprotocol containing a
+    space with ``HTTP 400`` before the request ever reaches the app, so it cannot
+    be the mechanism here.
+    """
+    auth = request.headers.get("authorization", "")
+    if auth.lower().startswith("bearer "):
+        return auth[7:].strip()
+
+    return request.query_params.get("access_token", "")
+
+
 def resolve_user(websocket: WebSocket, access_token: str) -> int | None:
-    """Authenticate a hub connection from its `access_token` query parameter."""
+    """Authenticate a hub connection from its bearer token."""
     from app.auth.tokens import decode_token
 
     if not access_token:

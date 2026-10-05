@@ -33,6 +33,26 @@ async def find_user_by_name(name: str) -> UserRow | None:
     return UserRow(*row)
 
 
+async def find_user_by_id(user_id: int) -> UserRow | None:
+    """Look a user up by numeric id.
+
+    Needed for `GET /api/v2/users/{id}/{ruleset}`, which the client calls for
+    every user it renders -- so name lookup alone does not cover it.
+    """
+    async with session_factory() as session:
+        result = await session.execute(
+            text(
+                "SELECT id, name, priv, country, creation_time, latest_activity, preferred_mode "
+                "FROM users WHERE id = :id LIMIT 1"
+            ),
+            {"id": user_id},
+        )
+        row = result.first()
+    if row is None:
+        return None
+    return UserRow(*row)
+
+
 async def get_password_hash(user_id: int) -> str | None:
     async with session_factory() as session:
         result = await session.execute(text("SELECT pw_bcrypt FROM users WHERE id = :id"), {"id": user_id})

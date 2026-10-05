@@ -21,11 +21,37 @@ def hash_password(plaintext: str) -> str:
 
 
 def verify_password(plaintext: str, stored: str) -> bool:
+    """Check a password, accepting either a plaintext or an already-hashed form.
+
+    Two clients log in to the same table with different credentials, and this is
+    the only place that reconciles them:
+
+    * **lazer** sends the **plaintext** password, so ``md5`` it to match the
+      stored form.
+    * **stable** never holds the plaintext. ``Options_Login.cs:84`` stores
+      ``CryptoHelper.GetMd5String(password)`` and every bancho call sends that
+      digest as ``h=``, because bancho's schema *is* the md5. So the value
+      arriving here is already md5'd, and md5-ing it again computes
+      ``bcrypt(md5(md5(pw)))``, which never matches.
+
+    The md5-hex form is tried second rather than first: the canonical path stays
+    one bcrypt check, so lazer (the majority) pays nothing, and only stable pays
+    for the extra comparison.
+
+    Trying both is preferred over sniffing "looks like 32 hex chars", which would
+    misfire on a genuinely hex-looking plaintext password, and over a form flag,
+    which would add a wire parameter both clients have to know about. Nothing is
+    weakened: both branches test the same secret, since stable already puts the
+    md5 hex into every bancho request in cleartext.
+    """
     if not stored:
         return False
-    digest = hashlib.md5(plaintext.encode()).hexdigest()  # noqa: S324 - required by the bancho schema
+
     try:
-        return bcrypt.checkpw(digest.encode(), stored.encode())
+        if bcrypt.checkpw(hashlib.md5(plaintext.encode()).hexdigest().encode(), stored.encode()):  # noqa: S324
+            return True
+
+        return bcrypt.checkpw(plaintext.encode(), stored.encode())
     except ValueError:
         # malformed hash in the row; treat as a failed login rather than a 500
         return False

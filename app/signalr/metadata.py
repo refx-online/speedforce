@@ -173,26 +173,36 @@ class MetadataHub:
                 online.add(int(_text(key).rsplit(":", 1)[1]))
 
         for user_id in sorted(online - {connection.user_id}):
-            await connection.send(
-                "UserPresenceUpdated", user_id, _loads(await r.get(PRESENCE_KEY.format(user_id=user_id)))
-            )
+            stored = _loads(await r.get(PRESENCE_KEY.format(user_id=user_id)))
+            presence = presence_to_client(stored)
+            if presence is not None:
+                await connection.send("UserPresenceUpdated", user_id, presence)
 
         return None
 
     async def _get_changes_since(self, queue_id: int) -> dict[str, Any]:
         """Queue cursor for reconnect catch-up.
 
+        Field names must match ``osu.Game/Online/Metadata/BeatmapUpdates.cs``:
+        ``BeatmapSetIDs`` and ``LastProcessedQueueID``. Returning anything else
+        fails deserialisation during connect, which leaves the client stuck on
+        "signing in" forever -- no further hub calls ever happen.
+
         A full deployment keeps an append-only change log keyed by this id. Here
-        the cursor only advances: enough for the client's reconnect path to
-        complete without replaying changes it has already applied.
+        the cursor only advances: enough for the reconnect path to complete
+        without replaying changes already applied.
         """
         r = await self.redis()
-        return {"beatmapSets": [], "queueId": int(await r.get(QUEUE_KEY) or 0)}
+        return {"beatmapSetIDs": [], "lastProcessedQueueID": int(await r.get(QUEUE_KEY) or 0)}
 
     async def broadcast(self, user_id: int) -> None:
         """Push one user's presence to every connection watching them."""
         r = await self.redis()
-        payload = _loads(await r.get(PRESENCE_KEY.format(user_id=user_id)))
+        stored = _loads(await r.get(PRESENCE_KEY.format(user_id=user_id)))
+        payload = presence_to_client(stored)
+
+        if payload is None:
+            return
 
         for conn in list(self._live):
             if conn is not None and conn.user_id != user_id and self._watches(conn, user_id):
@@ -214,6 +224,96 @@ def _loads(raw: Any) -> Any:
         return json.loads(body)
     except json.JSONDecodeError:
         return body
+
+
+# ---------------------------------------------------------------------------
+# Presence -> client wire shape.
+#
+# Stored presence is JSON (`{"Activity": {...}, "Status": ...}`) because that is
+# the documented shared contract with bakenohana's presence bridge -- do not
+# change the stored form without changing that side too.
+#
+# What the *client* binds is different, and is a `UserPresence`:
+#
+#     [MessagePackObject] struct UserPresence { [Key(0)] Activity; [Key(1)] Status; }
+#
+# so on the wire it is an **integer-keyed** map, and `Activity` is a `[Union]`
+# encoded by `UnionFormatter` as a two-element array `[unionKey, payload]`.
+# Sending the stored JSON shape verbatim therefore decodes to nothing on the
+# client, which is why the players list stayed empty.
+#
+# Cross-checked against a working implementation:
+# `GooGuTeam/g0v0.Server.Realtime` `Objects/States/PlayerState.cs:62`
+# (`new UserPresence { Activity = ..., Status = ... }`) and
+# `Hubs/MetadataHub.cs:89` -- it hands the real DTO to SignalR, so the integer
+# keys come from the client's own attributes.
+# ---------------------------------------------------------------------------
+
+# UserActivity union keys, from `[Union(N, ...)]` in osu.Game/Users/UserActivity.cs
+_UNION_KEYS = {
+    "ChoosingBeatmap": 11,
+    "InSoloGame": 12,
+    "WatchingReplay": 13,
+    "SpectatingUser": 14,
+    "SearchingForLobby": 21,
+    "InLobby": 22,
+    "InMultiplayerGame": 23,
+    "SpectatingMultiplayerGame": 24,
+    "InPlaylistGame": 31,
+    "EditingBeatmap": 41,
+    "ModdingBeatmap": 42,
+    "TestingBeatmap": 43,
+}
+
+# `InGame` subclasses share one [Key] layout (UserActivity.cs:67-78):
+# 0 BeatmapID, 1 BeatmapDisplayTitle, 2 RulesetID, 3 RulesetPlayingVerb
+_IN_GAME_TYPES = {"InSoloGame", "InMultiplayerGame", "SpectatingMultiplayerGame", "InPlaylistGame"}
+
+# `UserStatus` ordinals (osu.Game/Users/UserStatus.cs): Offline=0,
+# DoNotDisturb=1, Online=2. JSON stores the name; the wire wants the ordinal.
+_STATUS_ORDINALS = {"Offline": 0, "DoNotDisturb": 1, "Online": 2}
+
+
+def _activity_payload(kind: str, activity: dict[str, Any]) -> list[Any]:
+    """Build the `[key, payload]` array a `UnionFormatter` writes."""
+    key = _UNION_KEYS.get(kind)
+    if key is None:
+        # Unknown activity: relay as an empty ChoosingBeatmap rather than drop the
+        # user from the list entirely. Losing the row is worse than a wrong verb.
+        return [_UNION_KEYS["ChoosingBeatmap"], {}]
+
+    if kind in _IN_GAME_TYPES:
+        return [
+            key,
+            {0: activity.get("BeatmapID"), 1: activity.get("BeatmapDisplayTitle"), 2: activity.get("RulesetID")},
+        ]
+
+    # Every other declared activity carries no [Key] members, so an empty map.
+    return [key, {}]
+
+
+def presence_to_client(stored: Any) -> dict[int, Any] | None:
+    """Translate a stored presence document into the client's `UserPresence`.
+
+    Returns None when there is nothing to show, which is the client's signal for
+    "this user is not online".
+    """
+    if not isinstance(stored, dict):
+        return None
+
+    activity = stored.get("Activity")
+    status = stored.get("Status")
+
+    # Offline / unknown status means offline, as in the reference implementation
+    # (PlayerState.cs:63 returns null for Offline).
+    ordinal = _STATUS_ORDINALS.get(str(status) if status is not None else "")
+    if ordinal is None or ordinal == 0:
+        return None
+
+    if not isinstance(activity, dict):
+        return {0: None, 1: ordinal}
+
+    return {0: _activity_payload(str(activity.get("type") or ""), activity), 1: ordinal}
 
 
 hub = MetadataHub()

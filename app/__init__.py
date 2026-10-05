@@ -9,6 +9,9 @@ from app.route import router as route_router
 # importing the hub module is what registers /signalr/metadata; the import sits
 # below the host import it depends on
 from app.signalr import metadata as _metadata_hub  # noqa: F401
+from app.signalr import multiplayer as _multiplayer_hub  # noqa: F401
+from app.signalr import notifications as _notifications_socket  # noqa: F401
+from app.signalr import spectator as _spectator_hub  # noqa: F401
 from app.signalr.host import router as signalr_router
 from app.signalr.metadata import start_stable_presence
 from app.signalr.metadata import stop_stable_presence
