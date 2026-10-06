@@ -103,6 +103,16 @@ class MultiplayerHub:
                 raise ValueError("already in a room")
 
         created = MultiplayerRoom(settings, user)
+
+        # `MultiplayerRoomSettings` has no beatmap member at all, so the playlist
+        # cannot be seeded from the settings the way it used to be -- lazer sends
+        # the playlist explicitly (`Key(6)`) and that is where the beatmap
+        # actually lives. Prefer the client's own playlist, falling back to the
+        # seeded one for a client that sends none.
+        supplied = _playlist_from_room(room)
+
+        if supplied:
+            created.playlist = supplied
         await _hydrate_playlist_items(created.playlist)
         rooms[created.room_id] = created
         _user_rooms[connection.user_id] = created.room_id
@@ -512,6 +522,45 @@ _SETTINGS_FIELDS = (
     "AutoSkip",
     "MaxParticipants",
 )
+
+
+def _playlist_from_room(raw: Any) -> list:
+    """Read the playlist a client sent with `CreateRoom`.
+
+    `MultiplayerRoom` `Key(6)` is the playlist, a list of
+    `MultiplayerPlaylistItem`. Both spellings are accepted: a positional array
+    from a real client, and an int-keyed dict from our own code and the JSON hub
+    protocol.
+
+    Each item is `Key(0)` ID, `Key(1)` OwnerID, `Key(2)` BeatmapID,
+    `Key(3)` BeatmapChecksum, `Key(4)` RulesetID ...
+    """
+    raw_playlist = _get(raw, 6, "Playlist")
+    if not isinstance(raw_playlist, (list, tuple)):
+        return []
+
+    from app.signalr.rooms import PlaylistItem
+
+    items: list[PlaylistItem] = []
+    for order, entry in enumerate(raw_playlist):
+        beatmap_id = int(_get(entry, 2, "BeatmapID", 0) or 0)
+        if beatmap_id <= 0:
+            continue
+
+        owner_id = int(_get(entry, 1, "OwnerID", 0) or 0)
+
+        items.append(
+            PlaylistItem(
+                beatmap_id=beatmap_id,
+                beatmap_md5=str(_get(entry, 3, "BeatmapChecksum", "") or ""),
+                ruleset_id=int(_get(entry, 4, "RulesetID", 0) or 0),
+                player_id=owner_id or None,
+                item_id=len(items) + 1,
+                playlist_order=order,
+            )
+        )
+
+    return items
 
 
 def _parse_settings(raw: Any):
