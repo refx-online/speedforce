@@ -259,6 +259,20 @@ async def join_channel(channel_id: int, user_id: int, _: UserRow = Depends(requi
     return JSONResponse(content={})
 
 
+@router.get("/chat/channels/{channel_id}/mark-as-read/{message_id}")
+async def mark_channel_message_read(
+    channel_id: int, message_id: int, _: UserRow = Depends(require_user)
+) -> JSONResponse:
+    """`MarkChannelAsReadRequest` -- a **GET**, not a POST.
+
+    The client sends this the moment a channel is opened, once per channel the
+    user is in. There is no read-state model behind it, and returning 204/200
+    either way keeps the client from retrying; the channel list is empty anyway,
+    so in practice this is only reached for the two channels lazer hardcodes.
+    """
+    return JSONResponse(content={})
+
+
 @router.post("/chat/updates")
 async def ack_chat_updates(_: UserRow = Depends(require_user)) -> JSONResponse:
     return JSONResponse(content={})
