@@ -225,7 +225,7 @@ class RoomSettings:
     mods: list[dict[str, Any]] = field(default_factory=list)
     max_players: int = MAX_PLAYERS
 
-    def to_client(self) -> dict[int, Any]:
+    def to_client(self, playlist_item_id: int = 0) -> dict[int, Any]:
         """Hub shape for `MultiplayerRoomSettings`.
 
         **Integer keys, in the client's declared order.** Note key 2 is
@@ -235,7 +235,16 @@ class RoomSettings:
         """
         return {
             0: self.name,  # Name
-            1: self.beatmap_id,  # PlaylistItemId
+            # Key(1) is **PlaylistItemId**, not a beatmap id: it names the room's
+            # current item. lazer resolves the current playlist item with
+            #
+            #     APIRoom.Playlist.Single(i => i.ID == joinedRoom.Settings.PlaylistItemId)
+            #
+            # and `Single` throws on zero matches, so pointing it at a beatmap id (or
+            # at 0, as this did whenever the client supplied the playlist itself)
+            # made every join fail inside `setupJoinedRoom` and lazer's UI never
+            # reached `OnRoomJoined()`. The caller passes the real current item id.
+            1: playlist_item_id,  # PlaylistItemId
             2: self.password or "",  # Password
             3: _MATCH_TYPE_HEAD_TO_HEAD,  # MatchType
             4: _QUEUE_MODE_HOST_ONLY,  # QueueMode
@@ -410,11 +419,12 @@ class MultiplayerRoom:
         which is why the order is spelled out member by member.
         """
         host = self.users.get(self.host_id)
+        current_item_id = self.playlist[0].item_id if self.playlist else 0
 
         return {
             0: self.room_id,  # RoomID
             1: _ROOM_STATE[self.state],  # State
-            2: self.settings.to_client(),  # Settings
+            2: self.settings.to_client(current_item_id),  # Settings
             3: [u.to_client() for u in self.users.values()],  # Users
             4: host.to_client() if host else None,  # Host
             5: self.match_state,  # MatchState

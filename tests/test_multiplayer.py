@@ -235,6 +235,62 @@ async def main() -> int:
         # Key *types* come from the room object, since JSON stringifies them.
         raw_room = room_registry[room_id].to_client()
         check("room map keys are integers, not strings", all(isinstance(k, int) for k in raw_room), str(list(raw_room)))
+
+        # The client cannot run here, so the thing that has to be guarded is the
+        # *shape it will be asked to deserialize*. MessagePack-CSharp's typed
+        # reader is strict about arity: a `[MessagePackObject]` with N members
+        # reads exactly N elements, and a mismatch throws inside the client's
+        # invocation binder -- which surfaces as an empty lobby and nothing else.
+        #
+        # Verified this way against every real frame the server produced: the
+        # layouts below are transcribed from MPv2Dtos.cs, and RulesetId/BeatmapId
+        # are `int?` there so nil is legal.
+        from app.signalr.protocol import positionalise
+
+        def as_wire(value):
+            """The arrays the client actually receives, not our int-keyed maps."""
+            return positionalise(value)
+
+        def arity(where, value, expected, optional=()):
+            if not isinstance(value, list) or len(value) != expected:
+                check(f"{where} has {expected} elements", False, f"got {str(value)[:110]}")
+                return False
+            check(f"{where} has {expected} elements", True)
+            return True
+
+        wire_room = as_wire(raw_room)
+
+        if arity("room", wire_room, 9):
+            arity("room.Settings", wire_room[2], 8)
+            arity("room.Playlist[0]", wire_room[6][0], 12)
+            for i, user in enumerate(wire_room[3] or []):
+                if arity(f"room.Users[{i}]", user, 9):
+                    arity(f"room.Users[{i}].BeatmapAvailability", user[2], 2)
+            if wire_room[4] is not None:
+                arity("room.Host", wire_room[4], 9)
+            # lazer resolves the current item with `Playlist.Single(...)`, which
+            # throws on zero matches -- so PlaylistItemId must name a real item.
+            # Reading the client sources is the only way to know this; it is the
+            # reason lazer could join a room server-side and still never reach
+            # OnRoomJoined().
+            settings_wire = wire_room[2]
+            playlist_ids = [item[0] for item in wire_room[6]]
+            check(
+                "Settings.PlaylistItemId names an item that exists in the playlist",
+                settings_wire[1] in playlist_ids,
+                f"PlaylistItemId={settings_wire[1]} playlist ids={playlist_ids}",
+            )
+
+            check(
+                "playlist checksum is a string at index 3",
+                isinstance(wire_room[6][0][3], str),
+                repr(wire_room[6][0][3]),
+            )
+            check(
+                "StarRating is a number at index 10",
+                isinstance(wire_room[6][0][10], (int, float)),
+                repr(wire_room[6][0][10]),
+            )
         check("settings keys are integers", all(isinstance(k, int) for k in raw_room[2]), str(list(raw_room[2])))
         check("user keys are integers", all(isinstance(k, int) for k in raw_room[3][0]), str(list(raw_room[3][0])))
         check(
