@@ -243,7 +243,7 @@ class MultiplayerHub:
         self._assert_host(room, connection)
 
         room.settings = _parse_settings(settings)
-        await self._push(room, "SettingsChanged", room.settings.to_client())
+        await self._push(room, "SettingsChanged", self._settings_payload(room))
 
     async def _ChangeState(self, connection: HubConnection, state: Any) -> None:
         room = self._room_for(connection)
@@ -311,6 +311,17 @@ class MultiplayerHub:
         if not room.is_host(connection.user_id):
             raise NotHost(f"user {connection.user_id} is not the host")
 
+    def _settings_payload(self, room: MultiplayerRoom) -> dict[int, Any]:
+        """`MultiplayerRoomSettings` for a push, carrying the real current item id.
+
+        `to_client()` alone defaults `PlaylistItemId` to 0, and lazer resolves the
+        current item with `Playlist.Single(i => i.ID == Settings.PlaylistItemId)`,
+        which throws on zero matches -- so a `SettingsChanged` carrying 0 would
+        break the client the same way the initial room did.
+        """
+        current = room.playlist[0].item_id if room.playlist else 0
+        return room.settings.to_client(current)
+
     async def _push(self, room: MultiplayerRoom, target: str, *args: Any, skip: str | None = None) -> None:
         for conn in list(self._connections.values()):
             if skip is not None and conn.connection_id == skip:
@@ -344,7 +355,7 @@ class MultiplayerHub:
         if room.state == IDLE:
             await self._push(room, "PlaylistItemChanged", parsed.to_client())
         if room.sync_current_item():
-            await self._push(room, "SettingsChanged", room.settings.to_client())
+            await self._push(room, "SettingsChanged", self._settings_payload(room))
 
     async def _EditPlaylistItem(self, connection: HubConnection, item: Any) -> None:
         room = self._room_for(connection)
@@ -367,7 +378,7 @@ class MultiplayerHub:
         await self._push(room, "PlaylistItemChanged", existing.to_client())
 
         if room.sync_current_item():
-            await self._push(room, "SettingsChanged", room.settings.to_client())
+            await self._push(room, "SettingsChanged", self._settings_payload(room))
 
     async def _RemovePlaylistItem(self, connection: HubConnection, playlist_item_id: int) -> None:
         room = self._room_for(connection)
@@ -379,7 +390,7 @@ class MultiplayerHub:
         await self._push(room, "PlaylistItemRemoved", removed.item_id)
 
         if room.sync_current_item():
-            await self._push(room, "SettingsChanged", room.settings.to_client())
+            await self._push(room, "SettingsChanged", self._settings_payload(room))
 
     async def _ChangeBeatmapAvailability(self, connection: HubConnection, availability: Any) -> None:
         """Record a client's map-download state.
