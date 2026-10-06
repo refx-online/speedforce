@@ -93,7 +93,31 @@ class MultiplayerHub:
 
     # ------------------------------------------------------------------ lounge
 
-    async def _CreateRoom(self, connection: HubConnection, room: Any) -> dict[int, Any]:
+    async def _CreateRoom(self, connection: HubConnection, *args: Any) -> dict[int, Any]:
+        """Create a room from `CreateRoom(MultiplayerRoom)`.
+
+        Accepts the room either as one argument or as its fields spread across
+        several. The refx-stable client sends the latter -- its frame put the room
+        straight into the arguments slot instead of wrapping it, so the room's
+        nine fields arrived as nine arguments and this raised
+
+            TypeError: _CreateRoom() takes 3 positional arguments but 10 were given
+
+        which surfaced client-side as a frozen lobby: `OnCreateGameMPv2` sets
+        `LobbyStatus.PendingCreate` before the call and only clears it in the
+        success/failure callbacks, so a completion it never understood left the
+        screen stuck rather than reporting anything.
+
+        Re-wrapping at the boundary is the right place for this: the method
+        semantically takes exactly one room, and both spellings name it.
+        """
+        if len(args) > 1:
+            room = list(args)
+        elif args:
+            room = args[0]
+        else:
+            raise ValueError("CreateRoom called with no room")
+
         settings = _parse_settings(room)
         user = _user(connection)
 
