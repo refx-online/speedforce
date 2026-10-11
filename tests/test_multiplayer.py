@@ -12,6 +12,7 @@ import asyncio
 import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 from starlette.testclient import TestClient
@@ -24,6 +25,10 @@ from test_ranked_submit import sql
 
 from app import asgi_app  # noqa: E402
 from app.auth.tokens import hash_password  # noqa: E402
+from app.signalr import bridge  # noqa: E402
+from app.signalr import multiplayer
+from app.signalr.multiplayer import _user_rooms
+from app.signalr.multiplayer import hub as multiplayer_hub
 from app.signalr.multiplayer import rooms as room_registry  # noqa: E402
 
 RS = "\x1e"
@@ -179,6 +184,83 @@ async def main() -> int:
         R = ik(room)
         check("room map keys are 0..8", sorted(R.keys()) == list(range(9)), f"got {sorted(R.keys())}")
         check("room name is Settings -> Name", R[2][0] == "re;fx test", str(R.get(2)))
+
+        # ------------------------------------------------- create publishes
+        #
+        # `_CreateRoom` registers the room and returns it, but for a long time it
+        # never published, and because every other projection test calls
+        # `bridge.project(room)` directly as a pure function, 116 green tests hid
+        # it completely: the room existed in speedforce and simply never appeared
+        # in bakenohana's lobby. Assert the *effect*, not the payload shape --
+        # publish is what makes the room visible across the bridge.
+        #
+        # Driven by calling `_CreateRoom` directly rather than over a second
+        # websocket: `open_hub` is once-per-module (a second one poisons the
+        # shared aiomysql pool with another event loop), and `mpa` is already
+        # seated from the section above.
+        print("\nlounge: create publishes")
+
+        published: list[dict] = []
+
+        async def _capture(room_obj, *_a, **_kw):
+            published.append(bridge.project(room_obj))
+
+        real_publish = bridge.publish
+        real_hydrate = multiplayer._hydrate_playlist_items
+
+        async def _no_hydrate(_items):
+            return None
+
+        # Only the two side effects worth intercepting are stubbed: the publish
+        # we are asserting on, and the beatmap hydration, which does a lookup on
+        # a pool bound to TestClient's portal loop.
+        bridge.publish = _capture  # type: ignore[method-assign]
+        multiplayer._hydrate_playlist_items = _no_hydrate  # type: ignore[method-assign]
+        try:
+            # Unbound call: `hub` is a `MultiplayerHub` *instance*, so
+            # `multiplayer_hub._CreateRoom(conn, room)` would bind `conn` to
+            # `self`, leave `args` empty, and raise "CreateRoom called with no
+            # room". That exception then took the `with TestClient(...)` teardown
+            # down with it -- teardown joins a portal thread that never wakes --
+            # so the traceback was swallowed and the run just hung. Hence the
+            # explicit class, and hence why this went undiagnosed for a while.
+            pub_res = await multiplayer.MultiplayerHub._CreateRoom(
+                multiplayer_hub,
+                SimpleNamespace(user_id=99001),
+                {"Settings": {"Name": "publish me", "RulesetId": 0, "MaxPlayers": 4}},
+            )
+        finally:
+            bridge.publish = real_publish  # type: ignore[method-assign]
+            multiplayer._hydrate_playlist_items = real_hydrate  # type: ignore[method-assign]
+
+        pub_id = ik(pub_res).get(0)
+        check("CreateRoom published a projection", len(published) == 1, f"{len(published)} publishes")
+        if published:
+            check(
+                "published projection carries the new room id",
+                published[0]["room_id"] == pub_id,
+                f"{published[0]['room_id']} != {pub_id}",
+            )
+            check(
+                "published projection carries the room name",
+                published[0]["name"] == "publish me",
+                str(published[0]["name"]),
+            )
+            check(
+                "published projection seats the host",
+                published[0]["slots"][0]["user_id"] != 0,
+                str(published[0]["slots"][0]),
+            )
+            check(
+                "published projection has 16 slots", len(published[0]["slots"]) == 16, str(len(published[0]["slots"]))
+            )
+
+        # Tidy up so this room does not linger. Scoped to the synthetic user on
+        # purpose: `_user_rooms.clear()` also drops `87 -> room 1`, which every
+        # section below resolves the host through, so they all fail with
+        # "not in a room".
+        room_registry.pop(pub_id, None)
+        _user_rooms.pop(99001, None)
 
         # The same thing, but the way a real MPv2 client sends it: `MatchSettings`
         # is `Key(0)` of `MultiplayerRoom`, so the nested map is under an integer
@@ -477,6 +559,99 @@ async def main() -> int:
             not ({"hasPassword", "maxParticipants", "playerCount", "participants"} & set(room)),
             str(sorted(room)),
         )
+
+    # ------------------------------------------------------ MPv1 projection
+    #
+    # The wire format bakenohana turns into a `Match` for stock stable. These
+    # assert the *shape*, because nothing on this side can catch a wrong field:
+    # a bad key is a silently blank row in the stable lobby, not an exception.
+    #
+    # NB: no `from app.signalr import bridge` here. An import inside a function
+    # makes that name local to the WHOLE function, so doing it here left `bridge`
+    # unbound all the way up at the create-publishes section -- and because the
+    # failing `with TestClient(...)` teardown joins a portal thread that never
+    # wakes, the UnboundLocalError was swallowed and the suite just hung.
+    from app.signalr.rooms import MultiplayerRoom
+    from app.signalr.rooms import PlaylistItem
+    from app.signalr.rooms import RoomSettings
+    from app.signalr.rooms import RoomUser
+
+    # No `slot` passed: the room must seat the host itself. It used to leave
+    # `host.slot` at the -1 default, so the projection named a `host_id` whose
+    # occupant appeared in no slot at all and stable clients saw an empty room.
+    host = RoomUser(user_id=42, username="hosty")
+    guest = RoomUser(user_id=43, username="guesty", slot=1)
+    host.ready = True
+
+    proj_room = MultiplayerRoom(RoomSettings(name="crossplay", ruleset_id=2), host)
+    proj_room.users[43] = guest
+    proj_room.playlist.append(
+        PlaylistItem(
+            beatmap_id=999,
+            beatmap_md5="d41d8cd98f00b204e9800998ecf8427e",
+            ruleset_id=2,
+            item_id=1,
+            beatmap_name="A Beatmap",
+        )
+    )
+
+    p = bridge.project(proj_room)
+
+    check("projection carries the room id", p["room_id"] == proj_room.room_id, str(p["room_id"]))
+    check("projection carries the name", p["name"] == "crossplay", str(p["name"]))
+    check("projection carries the host", p["host_id"] == 42, str(p["host_id"]))
+    check("projection carries the current beatmap id", p["map_id"] == 999, str(p["map_id"]))
+    check("projection carries the current beatmap md5", p["map_md5"].startswith("d41d8"), str(p["map_md5"]))
+    check("projection carries the current beatmap name", p["map_name"] == "A Beatmap", str(p["map_name"]))
+    check("projection carries the ruleset", p["ruleset_id"] == 2, str(p["ruleset_id"]))
+    check("projection is not in progress", p["in_progress"] is False, str(p["in_progress"]))
+
+    # 16 fixed slots: `Match` writes exactly 16 and a short list would silently
+    # shift every subsequent field in the packet.
+    check("projection has exactly 16 slots", len(p["slots"]) == 16, str(len(p["slots"])))
+    check("host occupies slot 0", p["slots"][0]["user_id"] == 42, str(p["slots"][0]))
+    check("guest occupies slot 1", p["slots"][1]["user_id"] == 43, str(p["slots"][1]))
+    check("empty slots carry user id 0", all(s["user_id"] == 0 for s in p["slots"][2:]), str(p["slots"][2]))
+    check("empty slots are not ready", all(s["ready"] is False for s in p["slots"][2:]), str(p["slots"][2]))
+    check("ready state is projected", p["slots"][0]["ready"] is True, str(p["slots"][0]))
+    check("not-ready state is projected", p["slots"][1]["ready"] is False, str(p["slots"][1]))
+    # Only what a `Match` slot consumes: an id and a ready flag. A name here
+    # would be a second copy of something the MPv1 wire never carries.
+    check(
+        "a slot carries only the fields a Match slot consumes",
+        all(set(s) == {"user_id", "ready"} for s in p["slots"]),
+        str(sorted(p["slots"][0])),
+    )
+
+    # json is the transport, so anything unserialisable is a 500 on every push.
+    try:
+        json.dumps(p)
+        check("projection is json serialisable", True)
+    except TypeError as e:
+        check("projection is json serialisable", False, str(e))
+
+    # An empty room must still project -- the host can create and disconnect
+    # before anyone joins, and a raise here would take down their session.
+    lonely = MultiplayerRoom(RoomSettings(name="empty"), RoomUser(user_id=7, username="solo", slot=0))
+    empty_p = bridge.project(lonely)
+    check("room with no playlist still projects", empty_p["map_id"] == 0, str(empty_p["map_id"]))
+    check("room with no playlist has no map name", empty_p["map_name"] == "", str(empty_p["map_name"]))
+
+    # ------------------------------------------------------ host disconnect
+    #
+    # Dropping the last connection must close the room, not promote the person
+    # who left to be host of one nobody is in. A leaked room also leaks its
+    # `Match` into the stable lobby: nothing else ever retracts it.
+    print("\nhost disconnect")
+
+    lonely_room = MultiplayerRoom(RoomSettings(name="dropout"), RoomUser(user_id=42, username="hosty"))
+    check("host is seated in slot 0", lonely_room.users[42].slot == 0, str(lonely_room.users[42].slot))
+    check("free_slot skips the seated host", lonely_room.free_slot() == 1, str(lonely_room.free_slot()))
+
+    room_registry[lonely_room.room_id] = lonely_room
+    _user_rooms[42] = lonely_room.room_id
+    await multiplayer_hub.on_disconnect(SimpleNamespace(connection_id="dropme", user_id=42))
+    check("last host disconnecting closes the room", lonely_room.room_id not in room_registry, "room survived the drop")
 
     room_registry.clear()
     print(f"\n{passed} passed, {len(failed)} failed")

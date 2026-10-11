@@ -15,6 +15,8 @@ from app.signalr import spectator as _spectator_hub  # noqa: F401
 from app.signalr.host import router as signalr_router
 from app.signalr.metadata import start_stable_presence
 from app.signalr.metadata import stop_stable_presence
+from app.signalr.multiplayer import start_intent_listener
+from app.signalr.multiplayer import stop_intent_listener
 from app.state.services import dispose
 
 
@@ -22,9 +24,13 @@ from app.state.services import dispose
 async def lifespan(app: FastAPI):
     # subscribe to bakenohana's presence channel so stable users show up for lazer
     await start_stable_presence()
+    # subscribe to the room-intent channel so stable players' actions in a
+    # projected room reach the room that actually owns them
+    await start_intent_listener()
     try:
         yield
     finally:
+        await stop_intent_listener()
         await stop_stable_presence()
         await dispose()
 

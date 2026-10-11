@@ -144,7 +144,14 @@ class PlaylistItem:
             7: self.expired,  # Expired
             8: self.playlist_order,  # PlaylistOrder
             9: None,  # PlayedAt (DateTimeOffset?) -- only meaningful once played
-            10: self.star_rating,  # StarRating
+            # `StarRating` is a non-nullable `double` upstream
+            # (osu.Game/Online/Rooms/MultiplayerPlaylistItem.cs:71), and
+            # MessagePack-CSharp cannot decode nil into a non-nullable value
+            # type -- it throws and the client's whole CreateRoom result fails
+            # to reshape with "Deserializing object of the `MultiplayerRoom`
+            # type for 'argument' failed". An unresolved rating is 0.0, not
+            # nil: the same value a client shows before the diff is known.
+            10: self.star_rating if self.star_rating is not None else 0.0,
             11: False,  # Freestyle
         }
 
@@ -188,6 +195,12 @@ class RoomUser:
     ruleset_id: int | None = None
     beatmap_availability: int = 0
     state: dict[str, Any] = field(default_factory=dict)
+    # MPv1's only per-player ready bit. Kept as its own field rather than folded
+    # into `state`: that dict is the client's `MultiplayerRoomUserState` union
+    # payload, and nothing ever populated it, so the bridge's read of
+    # `state.get("IsReady")` was permanently False -- every projected slot
+    # rendered not-ready no matter what the player did.
+    ready: bool = False
 
     def to_client(self) -> dict[int, Any]:
         """Hub shape for `MultiplayerRoomUser`.
@@ -262,6 +275,11 @@ class MultiplayerRoom:
         self.settings = settings
         self.state = IDLE
         self.host_id = host.user_id
+        # The host occupies slot 0. Without this `host.slot` stays at the -1
+        # default, `free_slot()` counts it as unassigned, and the bridge's
+        # slot projection drops the host entirely -- the room reaches stable
+        # clients with a `host_id` naming nobody who is actually seated.
+        host.slot = 0
         self.users: dict[int, RoomUser] = {host.user_id: host}
         self.playlist: list[PlaylistItem] = []
         self.created_at = time.time()
@@ -314,10 +332,30 @@ class MultiplayerRoom:
                 return slot
         return None
 
-    def add_user(self, user: RoomUser) -> RoomUser:
-        slot = self.free_slot()
+    def add_user(self, user: RoomUser, slot: int | None = None) -> RoomUser:
+        """Add a user, optionally pinned to a specific slot.
+
+        `slot` exists for the stable bridge. Both sides otherwise pick "first
+        free", which agrees only while everyone joined the same way; once a
+        stable and a lazer player are in the room together the two can pick
+        different indices and the stable client sees itself jump seats. The
+        stable side has already committed its player to a slot by the time we
+        hear about it, so that choice wins.
+
+        A pinned slot that is taken, or out of range, is refused rather than
+        silently moved: the stable client is showing the player somewhere
+        specific, and quietly seating them elsewhere is worse than a failure.
+        """
+        if slot is None:
+            slot = self.free_slot()
+        elif not 0 <= slot < min(self.settings.max_players, MAX_PLAYERS):
+            raise RoomFull(self.room_id)
+        elif any(u.slot == slot for u in self.users.values()):
+            raise RoomFull(self.room_id)
+
         if slot is None:
             raise RoomFull(self.room_id)
+
         user.slot = slot
         self.users[user.user_id] = user
         return user

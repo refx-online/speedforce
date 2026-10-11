@@ -719,6 +719,11 @@ def _decode_for_log(codec: Codec, frame: bytes) -> Any:
             return None
         _, consumed = header
         frame = frame[consumed:]
+    else:
+        # Text frames carry the 0x1E terminator, which is not JSON. Leaving it on
+        # made every logged outbound frame read `decode-failed: Extra data`,
+        # which looks like a protocol fault and is not one.
+        frame = frame.rstrip(RECORD_SEPARATOR)
 
     if codec.binary:
         try:

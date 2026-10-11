@@ -322,9 +322,17 @@ def _describe_inbound(message: dict[str, Any]) -> str:
 async def _dispatch(hub: HubHandler, connection: HubConnection, message: dict[str, Any]) -> None:
     msg_type = message.get(protocol.FIELD_TYPE)
 
-    # keepalive: answered with a Ping, which is what the spec calls for
+    # An inbound Ping is a liveness marker and is deliberately NOT answered.
+    #
+    # Answering it looks spec-correct but makes the keepalive self-sustaining:
+    # this side replies to the client's ping, the client replies to ours, and the
+    # two timers feed each other. A live run showed ~45 pings/sec against an
+    # intended 15s interval -- 1253 of 2580 log lines -- saturating the socket
+    # until real invocations stopped being served.
+    #
+    # ASP.NET Core does not reply to Ping either; `_keepalive` already runs our
+    # own independent 15s timer, so nothing is lost by staying quiet.
     if msg_type == protocol.MSG_PING:
-        await connection.ping()
         return
 
     if msg_type == protocol.MSG_INVOCATION:

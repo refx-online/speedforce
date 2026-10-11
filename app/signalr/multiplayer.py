@@ -23,8 +23,15 @@ validate would be worse than one that refuses.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import json
+import logging
 from typing import Any
 
+import redis.asyncio as aioredis
+
+from app.signalr import bridge
 from app.signalr.host import mount
 from app.signalr.protocol import HubConnection
 from app.signalr.rooms import IDLE
@@ -33,8 +40,12 @@ from app.signalr.rooms import BadPassword
 from app.signalr.rooms import MultiplayerRoom
 from app.signalr.rooms import NoSuchRoom
 from app.signalr.rooms import NotHost
+from app.signalr.rooms import RoomFull
+from app.signalr.rooms import RoomUser
 
-__all__ = ["MultiplayerHub", "hub", "rooms"]
+__all__ = ["MultiplayerHub", "hub", "rooms", "start_intent_listener", "stop_intent_listener"]
+
+_LOG = logging.getLogger(__name__)
 
 rooms: dict[int, MultiplayerRoom] = {}
 
@@ -65,16 +76,17 @@ class MultiplayerHub:
             return
 
         # a dropped connection leaves the room but must not strand it: promote
-        # someone else rather than leaving a hostless room
+        # someone else rather than leaving a hostless room. The leaver has to be
+        # excluded explicitly -- `room.users` still holds them here, so the last
+        # user to drop got "promoted" to host of a room nobody is in, and it
+        # leaked forever instead of closing.
         if room.is_host(connection.user_id):
-            remaining = list(room.users)
+            remaining = [u for uid, u in room.users.items() if uid != connection.user_id]
             if remaining:
-                # dict values are RoomUser; keys are user ids
-                successor = next(iter(room.users.values()))
-                room.host_id = successor.user_id
+                room.host_id = remaining[0].user_id
                 await self._push(room, "HostChanged", room.host_id)
             else:
-                del rooms[room.room_id]
+                await self._close(room)
                 return
 
         await self._user_left(room, connection.user_id)
@@ -141,6 +153,14 @@ class MultiplayerHub:
         rooms[created.room_id] = created
         _user_rooms[connection.user_id] = created.room_id
 
+        # Publish, but do NOT `_push`: the creating client already has the room in
+        # the completion payload it is about to receive, and `_push` only reaches
+        # connections already tracked in `_user_rooms` -- so pushing here would
+        # emit a `RoomJoined`-style event the creator never asked for and cannot
+        # use. The projection is the whole point of this call: without it a room
+        # created from a real client never reaches bakenohana's lobby at all.
+        await bridge.publish(created)
+
         return created.to_client()
 
     async def _JoinRoom(self, connection: HubConnection, room_id: int) -> dict[int, Any]:
@@ -186,10 +206,21 @@ class MultiplayerHub:
                 await self._push(room, "HostChanged", room.host_id, skip=connection.connection_id)
                 await self._user_left(room, connection.user_id)
                 return
-            del rooms[room.room_id]
+            await self._close(room)
             return
 
         await self._user_left(room, connection.user_id, skip=connection.connection_id)
+
+    async def _close(self, room: MultiplayerRoom) -> None:
+        """Drop a room from the registry and tell bakenohana to dispose it.
+
+        Every teardown goes through here rather than deleting inline, because
+        forgetting the publish leaves a ghost `Match` in the stable lobby that
+        answers `Failed to join multiplayer room` forever -- there is no other
+        event that would ever retract it.
+        """
+        rooms.pop(room.room_id, None)
+        await bridge.publish_closed(room.room_id)
 
     async def _user_left(self, room: MultiplayerRoom, user_id: int, skip: str | None = None) -> None:
         user = room.remove_user(user_id)
@@ -323,6 +354,13 @@ class MultiplayerHub:
         return room.settings.to_client(current)
 
     async def _push(self, room: MultiplayerRoom, target: str, *args: Any, skip: str | None = None) -> None:
+        # Publish the MPv1 projection here so every mutation that pushes also
+        # projects. This is NOT the only publish site and must not be treated as
+        # one: `_CreateRoom` cannot push (its creator has not received the room
+        # yet) so it publishes directly, and it did not for a long time, which
+        # meant rooms created by a real client never reached bakenohana.
+        await bridge.publish(room)
+
         for conn in list(self._connections.values()):
             if skip is not None and conn.connection_id == skip:
                 continue
@@ -653,6 +691,185 @@ def _parse_settings(raw: Any):
 
     # hub methods that exist on the client but are deliberately not implemented; they
     # all depend on playlist / match-settings support
+
+
+# ---------------------------------------------------------------------------
+# Stable -> lazer intents
+# ---------------------------------------------------------------------------
+#
+# bakenohana owns stable sessions and cannot mutate a room this hub owns, so a
+# stable player acting in a projected room publishes a request here and this hub
+# applies it. The room keeps exactly one writer; bakenohana asks rather than
+# tells, and every mutation still ends in a republished projection, so the
+# stable side converges on MPv2 state instead of asserting its own.
+#
+# The three actions below are the complete set, and the omissions are the point.
+# `start`, `settings`, `kick`, `lock` and host transfer are host-authoritative on
+# MPv2 and the host is a lazer player, so no stable session exists that could
+# authorise them -- bakenohana rejects those packets before they get here.
+
+
+class _IntentListener:
+    """Applies stable intents to rooms this hub owns."""
+
+    def __init__(self) -> None:
+        self._task: asyncio.Task[None] | None = None
+        self._pubsub: aioredis.client.PubSub | None = None
+
+    async def start(self) -> None:
+        if self._task is None:
+            self._task = asyncio.create_task(self._run(), name="mpv2-intent-listener")
+
+    async def stop(self) -> None:
+        if self._task is not None:
+            self._task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._task
+            self._task = None
+
+        if self._pubsub is not None:
+            with contextlib.suppress(Exception):
+                await self._pubsub.aclose()
+            self._pubsub = None
+
+    async def _run(self) -> None:
+        # Reconnect loop: a redis blip must not silently stop relaying intents,
+        # or stable players join rooms that quietly stop knowing about them.
+        while True:
+            try:
+                client = await bridge._client()  # noqa: SLF001 - same package, deliberate
+                self._pubsub = client.pubsub(ignore_subscribe_messages=True)
+                await self._pubsub.subscribe(bridge.INTENT_CHANNEL)
+
+                while True:
+                    message = await self._pubsub.get_message(ignore_subscribe_messages=True, timeout=30.0)
+                    if message is None:
+                        continue
+
+                    raw = message.get("data")
+                    if raw is None:
+                        continue
+
+                    await self._handle(_text(raw))
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - the listener must survive anything
+                with contextlib.suppress(Exception):
+                    if self._pubsub is not None:
+                        await self._pubsub.aclose()
+                self._pubsub = None
+                _LOG.warning("mpv2 intent listener reconnecting: %s", exc)
+                await asyncio.sleep(2.0)
+
+    async def _handle(self, payload: str) -> None:
+        try:
+            intent = json.loads(payload)
+        except ValueError:
+            _LOG.warning("ignoring unparseable intent: %r", payload[:200])
+            return
+
+        if not isinstance(intent, dict):
+            return
+
+        action = intent.get("action")
+        room_id = intent.get("room_id")
+        user_id = intent.get("user_id")
+
+        if not isinstance(action, str) or not isinstance(room_id, int) or not isinstance(user_id, int):
+            return
+
+        room = rooms.get(room_id)
+        if room is None:
+            # The room closed between the stable player acting and this landing.
+            # Not an error: bakenohana will get the projection and tear down its
+            # side too.
+            return
+
+        if action == "join":
+            await self._join(room, room_id, user_id, intent)
+        elif action == "leave":
+            await self._leave(room, room_id, user_id)
+        elif action == "ready":
+            await self._ready(room, user_id, bool(intent.get("ready")))
+        else:
+            _LOG.warning("ignoring unknown intent action %r", action)
+
+    async def _join(self, room: MultiplayerRoom, room_id: int, user_id: int, intent: dict[str, Any]) -> None:
+        if user_id in room.users:
+            # Already here -- a re-published projection or a double join. Seat
+            # them where they already are rather than failing, which is what
+            # `Player#join_match` does for the same reason.
+            await bridge.publish(room)
+            return
+
+        slot = intent.get("slot")
+        if not isinstance(slot, int) or isinstance(slot, bool):
+            slot = None
+
+        user = RoomUser(user_id=user_id, username=str(intent.get("username") or ""))
+
+        try:
+            room.add_user(user, slot=slot)
+        except RoomFull:
+            # bakenohana already showed the player a seat it cannot honour.
+            # Republishing makes the room's real occupancy authoritative, and
+            # the stable side drops the seat it invented on the next projection.
+            _LOG.warning("stable join refused for room %s: no slot %s", room_id, slot)
+            await bridge.publish(room)
+            return
+
+        # `_user_rooms` is what makes this user findable again, and what
+        # `on_disconnect` consults. A stable player has no SignalR connection to
+        # disconnect, so the entry has to be recorded the same way.
+        _user_rooms[user_id] = room_id
+
+        await hub._push(room, "UserJoined", user.to_client())  # noqa: SLF001 - same module
+
+    async def _leave(self, room: MultiplayerRoom, room_id: int, user_id: int) -> None:
+        user = room.users.get(user_id)
+        if user is None:
+            return
+
+        _user_rooms.pop(user_id, None)
+
+        # A stable player cannot hold MPv2 host authority (the host is a lazer
+        # session), so there is no host-transfer branch here. If the room empties
+        # the hub closes it and publishes the close, which retracts the `Match`.
+        if not room.users.keys() - {user_id}:
+            await hub._close(room)  # noqa: SLF001 - same module
+            return
+
+        room.remove_user(user_id)
+        await hub._push(room, "UserLeft", user.to_client())  # noqa: SLF001 - same module
+
+    async def _ready(self, room: MultiplayerRoom, user_id: int, ready: bool) -> None:
+        user = room.users.get(user_id)
+        if user is None or user.ready == ready:
+            return
+
+        user.ready = ready
+        await bridge.publish(room)
+
+
+def _text(raw: Any) -> str:
+    return raw.decode("utf-8", "replace") if isinstance(raw, bytes) else str(raw)
+
+
+_listener: _IntentListener | None = None
+
+
+async def start_intent_listener() -> None:
+    global _listener
+    if _listener is None:
+        _listener = _IntentListener()
+    await _listener.start()
+
+
+async def stop_intent_listener() -> None:
+    global _listener
+    if _listener is not None:
+        await _listener.stop()
+        _listener = None
 
 
 PENDING = frozenset(
