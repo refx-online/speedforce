@@ -212,14 +212,23 @@ _SORT_KEYS = {
 }
 
 
+# lazer's `Ruleset` enum serialises by name. Its ids are NOT in declaration
+# order -- Fomo is 3 and Mania is 2 -- so map by name rather than by position.
+_RULESET_IDS = {"osu": 0, "taiko": 1, "mania": 2, "fomo": 3}
+
+
 @router.get("/beatmaps/{beatmap_id}/scores")
 async def beatmap_scores(
     beatmap_id: int,
-    mode: int = Query(0),
+    mode: str = Query("0"),
     sort: str = Query("total_score"),
     user: UserRow = Depends(require_user),
 ) -> JSONResponse:
-    if not 0 <= mode <= 7:
+    # lazer binds `Ruleset` as a query parameter, which serialises as the enum
+    # *name* (`mode=osu`), not the int this route used to demand -- so a plain
+    # `mode: int` 422'd every leaderboard the client opened. Accept both.
+    ruleset = _RULESET_IDS.get(mode.lower()) if not mode.lstrip("-").isdigit() else int(mode)
+    if ruleset is None or not 0 <= ruleset <= 3:
         return JSONResponse(status_code=422, content={"error": "unsupported ruleset"})
 
     key = _SORT_KEYS.get(sort)
@@ -234,7 +243,7 @@ async def beatmap_scores(
         async with httpx.AsyncClient(timeout=15) as client:
             response = await client.get(
                 f"{settings.FORLORN_URL}/api/v1/lazer/beatmaps/{row.md5}/scores",
-                params={"mode": mode, "user_id": user.id},
+                params={"mode": ruleset, "user_id": user.id},
                 headers={"X-Internal-Token": settings.LAZER_INTERNAL_TOKEN},
             )
     except httpx.HTTPError:
@@ -252,7 +261,7 @@ async def beatmap_scores(
             "id": s["id"],
             "beatmap_id": beatmap_id,
             "user_id": s["user_id"],
-            "ruleset_id": mode,
+            "ruleset_id": ruleset,
             "accuracy": s["accuracy"],
             "max_combo": s["max_combo"],
             "mods": s["mods"],
