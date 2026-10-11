@@ -550,9 +550,13 @@ async def _hydrate_playlist_items(items) -> None:
     playlist would otherwise be 16 round trips, and this runs on every add.
 
     Uses the existing `beatmap_repo` rather than a new lookup, mirroring how the
-    reference resolves `IBeatmapRepository` in `RoomBase.GetStarRating`. Unknown
-    beatmaps are left blank rather than failing the add -- a map we have no row
-    for is normal (never-downloaded maps) and must not block the playlist.
+    reference resolves `IBeatmapRepository` in `RoomBase.GetStarRating`.
+
+    A beatmap we have no row for is asked for on the beatmap service, which
+    upserts `maps` on a miss. That is what makes the table self-healing: a map
+    nobody has ever played used to stay blank on both clients forever, because
+    the only other writer is a score submission. Every failure path here is
+    swallowed -- metadata is cosmetic and must never block the playlist.
     """
     from app.models.beatmap_repo import get_beatmap_rows_by_ids
 
@@ -567,15 +571,64 @@ async def _hydrate_playlist_items(items) -> None:
 
     by_id = {r.id: r for r in rows}
 
+    missing = []
     for item in pending:
         row = by_id.get(item.beatmap_id)
-        if row is None:
-            continue
+        if row is not None:
+            _apply_beatmap(item, row.title, row.artist, float(row.diff))
+        else:
+            missing.append(item)
 
-        item.beatmap_name = row.title
-        item.beatmap_artist = row.artist
-        # `diff` is the star rating column; star_rating is the hub's field name.
-        item.star_rating = float(row.diff)
+    # Concurrent: each of these is an HTTP round trip to the beatmap service,
+    # and a cold playlist of maps we have no rows for is all misses. Serial
+    # would put that behind every hub call this runs in.
+    if missing:
+        await asyncio.gather(*(_hydrate_from_service(item) for item in missing))
+
+
+def _apply_beatmap(item, title: str, artist: str, diff: float) -> None:
+    item.beatmap_name = title
+    item.beatmap_artist = artist
+    # `diff` is the star rating column; star_rating is the hub's field name.
+    item.star_rating = diff
+
+
+async def _hydrate_from_service(item) -> None:
+    """Ask the beatmap service for one map we have no row for.
+
+    `GET /v1/beatmap/:md5` resolves from the upstream mirrors and upserts into
+    `maps` when it misses, so the room gets real metadata and the next reader
+    of `maps` finds a row. By md5 because that is all the hub carries on a
+    playlist item.
+
+    The response is polymorphic: JSON `{status, beatmap: {...}}` on success, or
+    a bare `-1|false` (unknown) / `1|false` (known, .osu fetch failed). Only
+    the JSON is useful here, and it is what carries the three fields we want,
+    so there is no second query to re-read the row the service just wrote.
+    """
+    import httpx
+
+    from app.settings import BEATMAP_SERVICE_URL
+
+    if not item.beatmap_md5:
+        return
+
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            response = await client.get(f"{BEATMAP_SERVICE_URL}/v1/beatmap/{item.beatmap_md5}")
+
+        if response.status_code != 200:
+            return
+
+        payload = response.json()
+    except Exception:  # noqa: BLE001 - see above; the item simply stays blank
+        return
+
+    beatmap = payload.get("beatmap") if isinstance(payload, dict) else None
+    if not beatmap:
+        return
+
+    _apply_beatmap(item, beatmap.get("title", ""), beatmap.get("artist", ""), float(beatmap.get("diff") or 0.0))
 
 
 # `MultiplayerRoomSettings` (osu.Game/Online/Multiplayer/MultiplayerRoomSettings.cs):

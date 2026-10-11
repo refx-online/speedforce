@@ -573,6 +573,56 @@ async def main() -> int:
     # wakes, the UnboundLocalError was swallowed and the suite just hung.
     from app.signalr.rooms import MultiplayerRoom
     from app.signalr.rooms import PlaylistItem
+
+# ------------------------------------------------- beatmap self-healing
+    #
+    # A beatmap id we have no `maps` row for must not stay blank forever: the
+    # beatmap service resolves it by md5 and upserts. httpx is stubbed so this
+    # neither depends on a live service nor on a real map existing upstream.
+    class _StubResponse:
+        def __init__(self, payload):
+            self.status_code = 200
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+    class _StubClient:
+        payload = {"status": 1, "beatmap": {"title": "Healed", "artist": "Someone", "diff": 6.4}}
+
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc):
+            return False
+
+        async def get(self, url):
+            check("beatmap service is asked by md5", "/v1/beatmap/" in url, url)
+            return _StubResponse(self.payload)
+
+    real_client = httpx.AsyncClient
+    try:
+        httpx.AsyncClient = _StubClient
+        healed = PlaylistItem(beatmap_id=987654321, beatmap_md5="a" * 32, ruleset_id=0, item_id=1)
+        await multiplayer._hydrate_playlist_items([healed])
+        check("title came from the beatmap service", healed.beatmap_name == "Healed", str(healed.beatmap_name))
+        check("artist came from the beatmap service", healed.beatmap_artist == "Someone", str(healed.beatmap_artist))
+        check("diff became the star rating", healed.star_rating == 6.4, str(healed.star_rating))
+
+        # The service answers with a bare string when it cannot help. That must
+        # leave the item blank rather than raising into the hub call.
+        class _StubMiss(_StubClient):
+            payload = "-1|false"
+
+        httpx.AsyncClient = _StubMiss
+        missed = PlaylistItem(beatmap_id=987654322, beatmap_md5="b" * 32, ruleset_id=0, item_id=1)
+        await multiplayer._hydrate_playlist_items([missed])
+        check("an unresolvable map stays blank", missed.beatmap_name == "", str(missed.beatmap_name))
+    finally:
+        httpx.AsyncClient = real_client
     from app.signalr.rooms import RoomSettings
     from app.signalr.rooms import RoomUser
 
