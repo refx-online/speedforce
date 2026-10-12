@@ -131,9 +131,12 @@ class BeatmapSet(BaseModel):
     creator: str = ""
     source: str = ""
     tags: str = ""
-    # we have no genre/language/tag tables
-    genre: str = "Unknown"
-    language: str = "Unknown"
+    # we have no genre/language/tag tables. These are objects upstream
+    # (BeatmapSetOnlineGenre/Language are `{id, name}` structs), not strings --
+    # emitting a bare "Unknown" makes GetBeatmapSetRequest fail to deserialize
+    # outright, which takes the whole beatmap set with it.
+    genre: dict = Field(default_factory=lambda: {"id": 0, "name": "Unknown"})
+    language: dict = Field(default_factory=lambda: {"id": 0, "name": "Unknown"})
     status: int = STATUS_PENDING
     nsfw: bool = False
     has_favourited: bool = False
