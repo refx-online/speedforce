@@ -36,6 +36,26 @@ router = APIRouter(prefix="/api/v2", tags=["osu! API v2"])
 MAX_BATCH_IDS = 50
 
 
+async def _self_heal_set(beatmapset_id: int) -> bool:
+    """Ask beatmap-service to import a set we have no rows for.
+
+    `maps` is populated on demand: only a score submission or an explicit import
+    ever added a row, so a beatmap lazer has locally but the server has never
+    seen 404s on `/beatmapsets/{id}`. lazer then NREs in
+    `BeatmapDownloadTracker` because the beatmap's set came back null. Importing
+    here heals the table, so the next read finds it.
+
+    Returns True if the set may now be present. Best-effort: on any failure the
+    caller just keeps 404ing, exactly as before this existed.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            response = await client.get(f"{settings.BEATMAP_SERVICE_URL}/v1/import/{beatmapset_id}")
+    except httpx.HTTPError:
+        return False
+    return response.status_code == 200
+
+
 @router.get("/beatmapsets/search")
 async def search(
     q: str | None = None,
@@ -91,7 +111,12 @@ async def lookup_set(beatmap_id: int = Query(...)) -> JSONResponse:
     if set_id is None:
         return JSONResponse(status_code=404, content={"error": "beatmap not found"})
     rows = await get_beatmapset_rows(set_id)
-    beatmap_set = rows_to_set(rows)
+    beatmap_set = rows_to_set(rows) if rows else None
+
+    if beatmap_set is None and await _self_heal_set(set_id):
+        rows = await get_beatmapset_rows(set_id)
+        beatmap_set = rows_to_set(rows) if rows else None
+
     if beatmap_set is None:
         return JSONResponse(status_code=404, content={"error": "beatmapset not found"})
     return JSONResponse(content=beatmap_set.model_dump())
@@ -100,7 +125,12 @@ async def lookup_set(beatmap_id: int = Query(...)) -> JSONResponse:
 @router.get("/beatmapsets/{beatmapset_id}")
 async def get_set(beatmapset_id: int) -> JSONResponse:
     rows = await get_beatmapset_rows(beatmapset_id)
-    beatmap_set = rows_to_set(rows)
+    beatmap_set = rows_to_set(rows) if rows else None
+
+    if beatmap_set is None and await _self_heal_set(beatmapset_id):
+        rows = await get_beatmapset_rows(beatmapset_id)
+        beatmap_set = rows_to_set(rows) if rows else None
+
     if beatmap_set is None:
         return JSONResponse(status_code=404, content={"error": "beatmapset not found"})
     return JSONResponse(content=beatmap_set.model_dump())

@@ -13,10 +13,12 @@ import asyncio
 import sys
 
 import httpx
+from types import SimpleNamespace
 
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent.parent))
 
 from app import asgi_app  # noqa: E402
+from app.route import beatmaps as beatmaps_route  # noqa: E402
 
 BASE = "/api/v2"
 passed = 0
@@ -140,6 +142,37 @@ async def main() -> int:
         check("unknown beatmap is 404", r.status_code == 404, str(r.status_code))
         r = await c.get("/api/v2/beatmaps/lookup?id=5649109")
         check("lookup still routes correctly", r.status_code == 200, str(r.status_code))
+
+        print("\nunknown set self-heals via the beatmap service")
+        # A set with no `maps` row 404s lazer's request and leaves
+        # `APIBeatmap.BeatmapSet` null, which NREs `BeatmapDownloadTracker`. The
+        # route therefore asks beatmap-service to import it first. Stubbed here so
+        # the test neither needs a live service nor actually imports a map.
+        asked: list[str] = []
+
+        class _Unavailable:
+            def __init__(self, *_a, **_k):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_exc):
+                return False
+
+            async def get(self, url):
+                asked.append(url)
+                raise httpx.HTTPError("beatmap service down")
+
+        real_httpx = beatmaps_route.httpx
+        try:
+            beatmaps_route.httpx = SimpleNamespace(AsyncClient=_Unavailable, HTTPError=httpx.HTTPError)
+            r = await c.get(f"{BASE}/beatmapsets/987654321")
+        finally:
+            beatmaps_route.httpx = real_httpx
+
+        check("a miss asks the beatmap service to import the set", any("/v1/import/987654321" in u for u in asked), str(asked))
+        check("it still 404s rather than 500ing when the service is down", r.status_code == 404, str(r.status_code))
 
     print(f"\n{passed} passed, {len(failed)} failed")
     for f in failed:
