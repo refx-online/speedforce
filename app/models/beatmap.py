@@ -63,6 +63,28 @@ class BeatmapUser(BaseModel):
     avatar_url: str = ""
 
 
+class BeatmapSetCompact(BaseModel):
+    """A set with no `beatmaps` -- the shape osu! nests on an individual beatmap.
+
+    `BeatmapSet` cannot be reused here: it carries `beatmaps: list[Beatmap]`, and
+    each of those carries a set again, so nesting one would not terminate.
+    """
+
+    id: int
+    artist: str = ""
+    title: str = ""
+    creator: str = ""
+    status: int = STATUS_PENDING
+    nsfw: bool = False
+    favourite_count: int = 0
+    play_count: int = 0
+    bpm: float = 0.0
+    covers: dict = Field(default_factory=dict)
+    submitted_date: str | None = None
+    ranked_date: str | None = None
+    last_updated: str | None = None
+
+
 class Beatmap(BaseModel):
     id: int
     beatmapset_id: int
@@ -92,6 +114,12 @@ class Beatmap(BaseModel):
     failtimes: dict = Field(default_factory=dict)
     is_scoreable: bool = True
     deleted_at: str | None = None
+    # osu! nests this on every beatmap it returns, and lazer binds it straight
+    # onto `APIBeatmap.BeatmapSet`. Omitting it left that null, and
+    # `OnlinePlayBeatmapAvailabilityTracker` does `new BeatmapDownloadTracker(
+    # beatmap.BeatmapSet)` behind a `Debug.Assert` -- a no-op in a Release build
+    # -- so the client died with an NRE the moment you picked a map.
+    beatmapset: BeatmapSetCompact | None = None
 
 
 class BeatmapSet(BaseModel):

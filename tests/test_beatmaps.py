@@ -138,6 +138,41 @@ async def main() -> int:
             check("count_sliders populated", b.get("count_sliders") == 121, str(b.get("count_sliders")))
             check("count_spinners populated", b.get("count_spinners") == 1, str(b.get("count_spinners")))
             check("hit_length real (not total_length)", b.get("hit_length") == 214, str(b.get("hit_length")))
+            # lazer binds this straight onto `APIBeatmap.BeatmapSet` and hands it
+            # to `new BeatmapDownloadTracker(...)` behind a Debug.Assert, so when
+            # it was absent the client NRE'd on every map pick.
+            check("beatmapset object is embedded, not just the id", isinstance(b.get("beatmapset"), dict), str(type(b.get("beatmapset"))))
+            check(
+                "embedded beatmapset has the real id",
+                (b.get("beatmapset") or {}).get("id") == 2548284,
+                str((b.get("beatmapset") or {}).get("id")),
+            )
+            check(
+                "embedded beatmapset carries artist and title",
+                bool((b.get("beatmapset") or {}).get("artist")) and bool((b.get("beatmapset") or {}).get("title")),
+                str((b.get("beatmapset") or {}).get("artist")),
+            )
+            check("embedded beatmapset does not recurse into beats", "beatmaps" not in (b.get("beatmapset") or {}), str(sorted((b.get("beatmapset") or {}).keys())))
+        r = await c.get("/api/v2/beatmaps/?ids[]=5649109")
+        check("batch beatmap is 200", r.status_code == 200, str(r.status_code))
+        if r.status_code == 200:
+            payload = r.json()
+            # `ids[]` answers with a map of id -> list of beatmaps
+            entries = next(iter(payload.values())) if isinstance(payload, dict) and payload else []
+            first = (entries[0] if entries else {}) or {}
+            # this is the request that feeds the lobby map pick, the one that
+            # crashed; a 200 without a set still crashes the client.
+            check("batch beatmap also embeds its set", isinstance(first.get("beatmapset"), dict), str(first.get("beatmapset")))
+        r = await c.get("/api/v2/beatmapsets/2548284")
+        if r.status_code == 200:
+            beats = (r.json() or {}).get("beatmaps") or []
+            # a set's own difficulties carry no nested set, matching osu!, and
+            # it is what stops the nesting terminating on itself.
+            check(
+                "difficulties inside a set carry no nested set",
+                all(x.get("beatmapset") is None for x in beats) if beats else True,
+                str([x.get("beatmapset") for x in beats][:3]),
+            )
         r = await c.get("/api/v2/beatmaps/99999999")
         check("unknown beatmap is 404", r.status_code == 404, str(r.status_code))
         r = await c.get("/api/v2/beatmaps/lookup?id=5649109")

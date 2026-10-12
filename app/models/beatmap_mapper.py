@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from app.models.beatmap import Beatmap
 from app.models.beatmap import BeatmapSet
+from app.models.beatmap import BeatmapSetCompact
 from app.models.beatmap import status_from_mask
 
 from .beatmap_repo import MapRow
@@ -13,7 +14,29 @@ from .beatmap_repo import MapRow
 ASSETS_BASE = "https://assets.ppy.sh/beatmaps"
 
 
-def row_to_beatmap(row: MapRow) -> Beatmap:
+def row_to_compact_set(row: MapRow) -> BeatmapSetCompact:
+    """The set a single difficulty belongs to, without its other difficulties.
+
+    The schema denormalises artist/title/creator onto every difficulty row, so
+    one row is enough to describe the set.
+    """
+    iso = row.last_update.isoformat() if hasattr(row.last_update, "isoformat") else None
+
+    return BeatmapSetCompact(
+        id=row.set_id,
+        artist=row.artist,
+        title=row.title,
+        creator=row.creator,
+        status=status_from_mask(row.status_mask, row.mode),
+        play_count=row.plays,
+        bpm=row.bpm,
+        covers=_covers(row.set_id),
+        last_updated=iso,
+        submitted_date=iso,
+    )
+
+
+def row_to_beatmap(row: MapRow, beatmapset: BeatmapSetCompact | None = None) -> Beatmap:
     return Beatmap(
         id=row.id,
         beatmapset_id=row.set_id,
@@ -40,7 +63,21 @@ def row_to_beatmap(row: MapRow) -> Beatmap:
         max_combo=row.max_combo,
         checksum=row.md5,
         last_updated=row.last_update.isoformat() if hasattr(row.last_update, "isoformat") else None,
+        beatmapset=beatmapset if beatmapset is not None else row_to_compact_set(row),
     )
+
+
+def _covers(set_id: int) -> dict:
+    return {
+        # no "header": osu! does not publish one (404s), so advertising it
+        # would just be a second broken image.
+        "list": [f"{ASSETS_BASE}/{set_id}/covers/list.jpg"],
+        "cover": f"{ASSETS_BASE}/{set_id}/covers/cover.jpg",
+        "cover@2x": f"{ASSETS_BASE}/{set_id}/covers/cover@2x.jpg",
+        "card": f"{ASSETS_BASE}/{set_id}/covers/card.jpg",
+        "card@2x": f"{ASSETS_BASE}/{set_id}/covers/card@2x.jpg",
+        "list@2x": f"{ASSETS_BASE}/{set_id}/covers/list@2x.jpg",
+    }
 
 
 def rows_to_set(rows: list[MapRow]) -> BeatmapSet | None:
@@ -54,6 +91,10 @@ def rows_to_set(rows: list[MapRow]) -> BeatmapSet | None:
 
     first = rows[0]
     beatmaps = [row_to_beatmap(r) for r in rows]
+    # A standalone beatmap carries its set, but a difficulty *inside* a set
+    # carries none -- which is also what keeps this nesting terminating.
+    for b in beatmaps:
+        b.beatmapset = None
 
     # set-level status: a set is "ranked" if any difficulty is approved, else
     # loved if any is loved, else the lowest-ranked status present.
@@ -73,16 +114,7 @@ def rows_to_set(rows: list[MapRow]) -> BeatmapSet | None:
         status=set_status,
         play_count=sum(r.plays for r in rows),
         bpm=first.bpm,
-        covers={
-            # no "header": osu! does not publish one (404s), so advertising it
-            # would just be a second broken image.
-            "list": [f"{ASSETS_BASE}/{first.set_id}/covers/list.jpg"],
-            "cover": f"{ASSETS_BASE}/{first.set_id}/covers/cover.jpg",
-            "cover@2x": f"{ASSETS_BASE}/{first.set_id}/covers/cover@2x.jpg",
-            "card": f"{ASSETS_BASE}/{first.set_id}/covers/card.jpg",
-            "card@2x": f"{ASSETS_BASE}/{first.set_id}/covers/card@2x.jpg",
-            "list@2x": f"{ASSETS_BASE}/{first.set_id}/covers/list@2x.jpg",
-        },
+        covers=_covers(first.set_id),
         beatmaps=beatmaps,
         last_updated=first.last_update.isoformat() if hasattr(first.last_update, "isoformat") else None,
         submitted_date=first.last_update.isoformat() if hasattr(first.last_update, "isoformat") else None,
