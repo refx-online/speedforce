@@ -150,6 +150,13 @@ class MultiplayerHub:
         if supplied:
             created.playlist = supplied
         await _hydrate_playlist_items(created.playlist)
+
+        # Serialise before the room is registered anywhere. It is pure, and if it
+        # threw with the room already in `rooms`/`_user_rooms` the creator would be
+        # wedged in a room they never received -- every later join then raises
+        # "already in a room" and only restarting the client clears it.
+        payload = created.to_client()
+
         rooms[created.room_id] = created
         _user_rooms[connection.user_id] = created.room_id
 
@@ -159,9 +166,16 @@ class MultiplayerHub:
         # emit a `RoomJoined`-style event the creator never asked for and cannot
         # use. The projection is the whole point of this call: without it a room
         # created from a real client never reaches bakenohana's lobby at all.
-        await bridge.publish(created)
+        try:
+            await bridge.publish(created)
+        except Exception:
+            # Same wedge, reached by a failed publish instead. Undo our own
+            # bookkeeping so the creator can retry or join something else.
+            rooms.pop(created.room_id, None)
+            _user_rooms.pop(connection.user_id, None)
+            raise
 
-        return created.to_client()
+        return payload
 
     async def _JoinRoom(self, connection: HubConnection, room_id: int) -> dict[int, Any]:
         return await self._join(connection, int(room_id), None)

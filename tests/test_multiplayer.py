@@ -262,6 +262,63 @@ async def main() -> int:
         room_registry.pop(pub_id, None)
         _user_rooms.pop(99001, None)
 
+        # A failed publish must not wedge the creator. Without the rollback the
+        # room stayed in `rooms` and `_user_rooms`, so the user's next CreateRoom
+        # hit "already in a room" and they had to restart the client to recover.
+        async def _boom(room_obj, *_a, **_kw):
+            raise RuntimeError("redis is down")
+
+        real_publish = bridge.publish
+        real_hydrate = multiplayer._hydrate_playlist_items
+
+        async def _no_hydrate2(_items):
+            return None
+
+        bridge.publish = _boom  # type: ignore[method-assign]
+        multiplayer._hydrate_playlist_items = _no_hydrate2  # type: ignore[method-assign]
+        raised = False
+        try:
+            await multiplayer.MultiplayerHub._CreateRoom(
+                multiplayer_hub,
+                SimpleNamespace(user_id=99002),
+                {"Settings": {"Name": "doomed", "RulesetId": 0, "MaxPlayers": 4}},
+            )
+        except RuntimeError:
+            raised = True
+        finally:
+            bridge.publish = real_publish  # type: ignore[method-assign]
+            multiplayer._hydrate_playlist_items = real_hydrate  # type: ignore[method-assign]
+
+        check("failed publish surfaces to the caller", raised, "no exception raised")
+        check("failed publish leaves the user out of _user_rooms", 99002 not in _user_rooms, "still registered")
+        check(
+            "failed publish leaves no orphan room",
+            all(room.settings.name != "doomed" for room in room_registry.values()),
+            "an orphan room survived",
+        )
+
+        # And the user really can create again afterwards, which is the whole
+        # point -- this is the call that used to fail with "already in a room".
+        async def _capture2(room_obj, *_a, **_kw):
+            published.append(bridge.project(room_obj))
+
+        bridge.publish = _capture2  # type: ignore[method-assign]
+        try:
+            retry_id = ik(
+                await multiplayer.MultiplayerHub._CreateRoom(
+                    multiplayer_hub,
+                    SimpleNamespace(user_id=99002),
+                    {"Settings": {"Name": "retry works", "RulesetId": 0, "MaxPlayers": 4}},
+                )
+            ).get(0)
+            check("the same user can create a room on retry", retry_id is not None, "no room id returned")
+            room_registry.pop(retry_id, None)
+        except Exception as exc:  # noqa: BLE001
+            check("the same user can create a room on retry", False, f"{type(exc).__name__}: {exc}")
+        finally:
+            bridge.publish = real_publish  # type: ignore[method-assign]
+            _user_rooms.pop(99002, None)
+
         # The same thing, but the way a real MPv2 client sends it: `MatchSettings`
         # is `Key(0)` of `MultiplayerRoom`, so the nested map is under an integer
         # key, not the string "Settings". `_parse_settings` only understood the
